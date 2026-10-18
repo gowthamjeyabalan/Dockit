@@ -1,0 +1,33 @@
+[package]
+name = "dockit"
+version = "0.1.0"
+edition = "2024"
+description = "A PDF editor: edit text, images and shapes, merge and split files, annotate, fill forms and sign"
+authors = ["Gowtham Jeyabalan"]
+
+[dependencies]
+# Same renderer choice as Overlay: OpenGL (glow) is lighter than wgpu.
+eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence"] }
+egui = "0.36"
+egui_dock = { version = "0.21", features = ["serde"] }
+# Only the raw PDFium function table is used (see src/pdf.rs); pdfium.dll ships next to the exe.
+pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_7881"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = "0.17"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff"] }
+lopdf = { version = "0.45.0", default-features = false }
+
+
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[build-dependencies]
+winresource = "0.1"
