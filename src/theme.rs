@@ -167,15 +167,17 @@ pub fn display_family() -> FontFamily {
 
 /// The Dockit mark drawn into `rect` (geometry in mark.rs).
 pub fn paint_mark(painter: &egui::Painter, rect: egui::Rect, ink: Color32, dot: Color32) {
-    use crate::mark::{DOT, OUTLINE, STROKE};
-    let s = rect.width().min(rect.height()) / 60.0;
-    let o = rect.center() - egui::vec2(30.0, 30.0) * s;
+    use crate::mark::{BOWL, DOT, STEM, STROKE};
+    // Without the icon's square, the letter itself (x 17–67, y 13–85) fills the rect.
+    let s = rect.width().min(rect.height()) / 72.0;
+    let o = rect.center() - egui::vec2(42.0, 49.0) * s;
     let at = |(x, y): (f32, f32)| o + egui::vec2(x, y) * s;
-    let pts: Vec<egui::Pos2> = OUTLINE.iter().map(|&p| at(p)).collect();
-    painter.add(egui::Shape::line(pts.clone(), Stroke::new(STROKE * s, ink)));
-    // Round ends and corners, as in the icon.
-    for p in pts {
-        painter.circle_filled(p, STROKE * s / 2.0, ink);
+    let w = STROKE * s;
+    painter.circle_stroke(at((BOWL.0, BOWL.1)), BOWL.2 * s, Stroke::new(w, ink));
+    painter.line_segment([at(STEM[0]), at(STEM[1])], Stroke::new(w, ink));
+    // Round ends, as in the icon.
+    for p in STEM {
+        painter.circle_filled(at(p), w / 2.0, ink);
     }
     painter.circle_filled(at((DOT.0, DOT.1)), DOT.2 * s, dot);
 }

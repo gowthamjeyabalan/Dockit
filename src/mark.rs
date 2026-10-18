@@ -1,12 +1,16 @@
-//! The Dockit mark: a page outline left open at its top right corner, where a blue dot sits as the
-//! folded corner. Same language as the Grapht and Overlay marks (round strokes, one blue dot).
-//! Geometry is in a 60-unit box. Shared by the interface (theme.rs) and the icon (build.rs).
+//! The Dockit mark: a lowercase "d" whose bowl holds the blue dot. Same language as the Grapht and
+//! Overlay marks (round strokes, one blue dot). Geometry is in a 100-unit box with a 10-unit
+//! stroke. Shared by the interface (theme.rs) and the icon (build.rs).
 
-/// The outline, drawn with round caps and joins.
-pub const OUTLINE: [(f32, f32); 5] = [(33.0, 8.0), (14.0, 8.0), (14.0, 52.0), (46.0, 52.0), (46.0, 21.0)];
-pub const STROKE: f32 = 7.0;
+/// The bowl: centre and radius (of the stroke's middle).
+pub const BOWL: (f32, f32, f32) = (42.0, 60.0, 20.0);
+/// The stem, drawn with round caps.
+pub const STEM: [(f32, f32); 2] = [(62.0, 18.0), (62.0, 80.0)];
+pub const STROKE: f32 = 10.0;
 /// The dot: centre and radius.
-pub const DOT: (f32, f32, f32) = (45.0, 9.0, 7.5);
+pub const DOT: (f32, f32, f32) = (42.0, 60.0, 7.5);
+/// Corner radius of the icon's square.
+pub const TILE_RADIUS: f32 = 22.0;
 
 pub const NIGHT: [u8; 3] = [0x14, 0x16, 0x1c];
 pub const PAPER: [u8; 3] = [0xf5, 0xf5, 0xf7];
@@ -23,8 +27,8 @@ fn dist_to_segment(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
 /// The app icon as RGBA pixels: the mark in Paper and Blue on a rounded Night square.
 pub fn icon_rgba(size: u32) -> Vec<u8> {
     let n = size as f32;
-    let s = n / 60.0;
-    let radius = 13.0 * s;
+    let s = n / 100.0;
+    let radius = TILE_RADIUS * s;
     let mut out = vec![0u8; (size * size * 4) as usize];
     const SS: u32 = 4;
     for y in 0..size {
@@ -42,12 +46,11 @@ pub fn icon_rgba(size: u32) -> Vec<u8> {
                         continue;
                     }
                     bg += 1.0;
-                    // The mark sits a little inside the square.
-                    let m = 0.82;
-                    let u = ((px / s - 30.0) / m + 30.0, (py / s - 30.0) / m + 30.0);
+                    let u = (px / s, py / s);
+                    let half = STROKE / 2.0;
                     if (u.0 - DOT.0).hypot(u.1 - DOT.1) <= DOT.2 {
                         dot += 1.0;
-                    } else if OUTLINE.windows(2).any(|w| dist_to_segment(u, w[0], w[1]) <= STROKE / 2.0) {
+                    } else if ((u.0 - BOWL.0).hypot(u.1 - BOWL.1) - BOWL.2).abs() <= half || dist_to_segment(u, STEM[0], STEM[1]) <= half {
                         ink += 1.0;
                     }
                 }
