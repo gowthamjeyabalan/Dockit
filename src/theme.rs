@@ -165,21 +165,28 @@ pub fn display_family() -> FontFamily {
     FontFamily::Name("display".into())
 }
 
-/// The Dockit mark drawn into `rect` (geometry in mark.rs).
+/// The Dockit mark drawn into `rect`. It is rasterized by mark.rs, the same code that draws the
+/// app icon, so the letter has exactly the icon's shape at every size.
 pub fn paint_mark(painter: &egui::Painter, rect: egui::Rect, ink: Color32, dot: Color32) {
-    use crate::mark::{BOWL, DOT, STEM, STROKE};
-    // Without the icon's square, the letter itself (x 17–67, y 13–85) fills the rect.
-    let s = rect.width().min(rect.height()) / 72.0;
-    let o = rect.center() - egui::vec2(42.0, 49.0) * s;
-    let at = |(x, y): (f32, f32)| o + egui::vec2(x, y) * s;
-    let w = STROKE * s;
-    painter.circle_stroke(at((BOWL.0, BOWL.1)), BOWL.2 * s, Stroke::new(w, ink));
-    painter.line_segment([at(STEM[0]), at(STEM[1])], Stroke::new(w, ink));
-    // Round ends, as in the icon.
-    for p in STEM {
-        painter.circle_filled(at(p), w / 2.0, ink);
-    }
-    painter.circle_filled(at((DOT.0, DOT.1)), DOT.2 * s, dot);
+    let ctx = painter.ctx();
+    let side = rect.width().min(rect.height());
+    let px = (side * ctx.pixels_per_point()).round().max(8.0) as u32;
+    let id = egui::Id::new(("dockit-mark", px));
+    let textures = ctx.data(|d| d.get_temp::<(egui::TextureHandle, egui::TextureHandle)>(id));
+    let (ink_tex, dot_tex) = textures.unwrap_or_else(|| {
+        let (a, b) = crate::mark::masks(px);
+        let image = |alpha: Vec<u8>| {
+            let rgba: Vec<u8> = alpha.iter().flat_map(|&v| [255, 255, 255, v]).collect();
+            egui::ColorImage::from_rgba_unmultiplied([px as usize, px as usize], &rgba)
+        };
+        let t = (ctx.load_texture(format!("mark-ink-{px}"), image(a), egui::TextureOptions::LINEAR), ctx.load_texture(format!("mark-dot-{px}"), image(b), egui::TextureOptions::LINEAR));
+        ctx.data_mut(|d| d.insert_temp(id, t.clone()));
+        t
+    });
+    let r = egui::Rect::from_center_size(rect.center(), egui::vec2(side, side));
+    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    painter.image(ink_tex.id(), r, uv, ink);
+    painter.image(dot_tex.id(), r, uv, dot);
 }
 
 /// Install fonts and both styles, then pick the appearance.
