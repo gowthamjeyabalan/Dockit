@@ -807,6 +807,40 @@ impl<'d> Page<'d> {
         Some(self.object_count() - 1)
     }
 
+    /// The crop box (l, b, r, t), or the media box when there is none.
+    pub fn crop_box(&self) -> [f32; 4] {
+        let (mut l, mut b, mut r, mut t) = (0.0, 0.0, 0.0, 0.0);
+        let l_ = lib();
+        unsafe {
+            if l_.FPDFPage_GetCropBox(self.h, &mut l, &mut b, &mut r, &mut t) == 0 {
+                l_.FPDFPage_GetMediaBox(self.h, &mut l, &mut b, &mut r, &mut t);
+            }
+        }
+        [l.min(r), b.min(t), l.max(r), b.max(t)]
+    }
+
+    pub fn media_box(&self) -> [f32; 4] {
+        let (mut l, mut b, mut r, mut t) = (0.0, 0.0, 0.0, 0.0);
+        unsafe { lib().FPDFPage_GetMediaBox(self.h, &mut l, &mut b, &mut r, &mut t) };
+        [l.min(r), b.min(t), l.max(r), b.max(t)]
+    }
+
+    /// Set the visible area. The page's content is untouched.
+    pub fn set_crop_box(&self, r: [f32; 4]) {
+        unsafe { lib().FPDFPage_SetCropBox(self.h, r[0], r[1], r[2], r[3]) };
+    }
+
+    pub fn set_media_box(&self, r: [f32; 4]) {
+        unsafe { lib().FPDFPage_SetMediaBox(self.h, r[0], r[1], r[2], r[3]) };
+    }
+
+    /// Transform everything drawn on the page by `m` (PDFium wraps the existing content in a
+    /// matrix rather than rewriting it).
+    pub fn transform_content(&self, m: [f32; 6]) -> bool {
+        let fm = FS_MATRIX { a: m[0], b: m[1], c: m[2], d: m[3], e: m[4], f: m[5] };
+        unsafe { lib().FPDFPage_TransFormWithClip(self.h, &fm, null()) != 0 }
+    }
+
     /// Draw page `src_page` of `src` on this page as one group (a form XObject), placed by `m`.
     /// PDFium copies the fonts and images it needs. Returns the new object's index.
     pub fn insert_page_as_group(&self, src: &Doc, src_page: usize, m: [f32; 6]) -> Option<usize> {

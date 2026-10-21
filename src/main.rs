@@ -11,6 +11,7 @@ mod editor;
 mod fonts;
 mod incremental;
 mod mark;
+mod pageops;
 mod panels;
 mod pdf;
 mod theme;

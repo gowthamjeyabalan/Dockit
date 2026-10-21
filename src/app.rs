@@ -91,6 +91,14 @@ pub struct App {
     last_paste: Option<std::time::Instant>,
     /// Set when PDFium could not be loaded; the app shows why instead of the editor.
     broken: Option<String>,
+    /// Open documents. The active one lives in `ed`; its slot here holds an empty placeholder.
+    tabs: Vec<Editor>,
+    active: usize,
+    crop: Option<crate::pageops::CropDialog>,
+    stamp: Option<crate::pageops::StampDialog>,
+    compress: Option<crate::pageops::CompressDialog>,
+    export: Option<crate::pageops::ExportDialog>,
+    images: Option<crate::pageops::ImagesDialog>,
 }
 
 impl App {
@@ -127,35 +135,156 @@ impl App {
             v_was_down: false,
             last_paste: None,
             broken,
+            tabs: vec![Editor::default()],
+            active: 0,
+            crop: None,
+            stamp: None,
+            compress: None,
+            export: None,
+            images: None,
+        }
+    }
+
+    // ── tabs ──
+
+    /// Make tab `j` the active one. The clipboard, style, signature and recent files go with you.
+    fn switch_tab(&mut self, j: usize) {
+        if j == self.active || j >= self.tabs.len() {
+            return;
+        }
+        self.ed.commit_edits();
+        let clip = self.ed.clip.take();
+        let (style, signature, recent) = (self.ed.style.clone(), self.ed.signature.clone(), self.ed.recent.clone());
+        std::mem::swap(&mut self.ed, &mut self.tabs[self.active]);
+        std::mem::swap(&mut self.ed, &mut self.tabs[j]);
+        self.active = j;
+        self.ed.clip = clip;
+        self.ed.style = style;
+        self.ed.signature = signature;
+        self.ed.recent = recent;
+    }
+
+    /// Open a new, empty tab and switch to it.
+    fn new_tab(&mut self) {
+        let mut fresh = Editor::default();
+        fresh.recent = self.ed.recent.clone();
+        self.tabs.push(fresh);
+        let j = self.tabs.len() - 1;
+        self.switch_tab(j);
+    }
+
+    /// Close the active tab without asking (the caller has already asked).
+    fn close_tab(&mut self) {
+        if self.tabs.len() <= 1 {
+            self.ed.close();
+            self.ed.reset_view_caches();
+            return;
+        }
+        let gone = self.active;
+        let next = if gone + 1 < self.tabs.len() { gone + 1 } else { gone - 1 };
+        self.switch_tab(next);
+        self.tabs.remove(gone);
+        if self.active > gone {
+            self.active -= 1;
+        }
+    }
+
+    /// A tab other than the active one with unsaved changes.
+    fn other_dirty_tab(&self) -> Option<usize> {
+        (0..self.tabs.len()).find(|&i| i != self.active && self.tabs[i].needs_save())
+    }
+
+    /// Where a document should open: the active tab when it is empty, otherwise a new tab.
+    fn tab_for_opening(&mut self) {
+        if self.ed.file.is_some() {
+            self.new_tab();
         }
     }
 
     fn request(&mut self, ctx: &egui::Context, action: Pending) {
         self.ed.commit_edits();
         self.ed.commit();
-        if self.ed.needs_save() {
-            self.ask_save = Some(action);
-        } else {
+        // Opening never replaces a document: it gets its own tab.
+        if matches!(action, Pending::Open | Pending::OpenFile(_)) || !self.ed.needs_save() {
             self.perform(ctx, action);
+        } else {
+            self.ask_save = Some(action);
         }
     }
 
     fn perform(&mut self, ctx: &egui::Context, action: Pending) {
         match action {
             Pending::Quit => {
+                // This tab was saved or let go; ask about the next one with changes.
+                if let Some(i) = self.other_dirty_tab() {
+                    let done = self.active;
+                    self.switch_tab(i);
+                    self.tabs.remove(done);
+                    if self.active > done {
+                        self.active -= 1;
+                    }
+                    self.ask_save = Some(Pending::Quit);
+                    return;
+                }
                 self.closing = true;
                 ctx.send_viewport_cmd(ViewportCommand::Close);
             }
-            Pending::Close => self.close_doc(),
-            Pending::Open => self.ed.open_dialog(),
-            Pending::OpenFile(p) => self.ed.open_path(&p),
+            Pending::Close => self.close_tab(),
+            Pending::Open => {
+                if let Some(p) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_file() {
+                    self.tab_for_opening();
+                    self.ed.open_path(&p);
+                }
+            }
+            Pending::OpenFile(p) => {
+                self.tab_for_opening();
+                self.ed.open_path(&p);
+            }
         }
         self.ed.reset_view_caches();
     }
 
-    fn close_doc(&mut self) {
-        self.ed.close();
-        self.ed.reset_view_caches();
+    /// Tab strip, shown when more than one document is open.
+    fn tab_bar(&mut self, ui: &mut Ui) {
+        let p = pal(ui.ctx());
+        let names: Vec<(String, bool)> = (0..self.tabs.len())
+            .map(|i| {
+                let e = if i == self.active { &self.ed } else { &self.tabs[i] };
+                (e.file.as_ref().map(|f| f.name()).unwrap_or_else(|| "New tab".into()), e.needs_save())
+            })
+            .collect();
+        let mut switch = None;
+        let mut close = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (i, (name, dirty)) in names.iter().enumerate() {
+                let on = i == self.active;
+                let frame = egui::Frame::new()
+                    .fill(if on { p.bg_elevated } else { egui::Color32::TRANSPARENT })
+                    .corner_radius(7)
+                    .inner_margin(Margin::symmetric(10, 4));
+                frame.show(ui, |ui| {
+                    let label = format!("{}{name}", if *dirty { "• " } else { "" });
+                    let text = egui::RichText::new(label).color(if on { p.text } else { p.text_secondary });
+                    if ui.add(egui::Label::new(text).sense(egui::Sense::click()).truncate()).clicked() {
+                        switch = Some(i);
+                    }
+                    if ui.add(egui::Button::new(egui::RichText::new("×").size(10.0).color(p.text_secondary)).frame(false)).on_hover_text("Close").clicked() {
+                        close = Some(i);
+                    }
+                });
+            }
+            if ui.add(egui::Button::new("+").frame(false)).on_hover_text("Open in a new tab (Ctrl+O)").clicked() {
+                self.request(ui.ctx(), Pending::Open);
+            }
+        });
+        if let Some(i) = switch {
+            self.switch_tab(i);
+        }
+        if let Some(i) = close {
+            self.switch_tab(i);
+            self.request(ui.ctx(), Pending::Close);
+        }
     }
 
     fn save_dialog(&mut self, ctx: &egui::Context) {
@@ -178,7 +307,7 @@ impl App {
     }
 
     fn modal_open(&self) -> bool {
-        self.ask_save.is_some() || self.combine.is_some() || self.split.is_some() || self.pad.is_some() || self.ed.password.is_some() || self.ed.error.is_some()
+        self.crop.is_some() || self.stamp.is_some() || self.compress.is_some() || self.export.is_some() || self.images.is_some() || self.ask_save.is_some() || self.combine.is_some() || self.split.is_some() || self.pad.is_some() || self.ed.password.is_some() || self.ed.error.is_some()
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -395,6 +524,18 @@ impl App {
                 if ui.add_enabled(has, egui::Button::new("Extract selected pages…")).clicked() {
                     self.ed.extract_pages();
                 }
+                if ui.button("Create a PDF from images…").clicked()
+                    && let Some(files) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff"]).pick_files()
+                {
+                    self.images = Some(crate::pageops::ImagesDialog::new(files));
+                }
+                ui.separator();
+                if ui.add_enabled(has, egui::Button::new("Export pages as images…")).clicked() {
+                    self.export = Some(crate::pageops::ExportDialog::new(&self.ed));
+                }
+                if ui.add_enabled(has, egui::Button::new("Compress…")).clicked() {
+                    self.compress = Some(crate::pageops::CompressDialog::new());
+                }
                 ui.separator();
                 if ui.button("Quit").clicked() {
                     self.request(ui.ctx(), Pending::Quit);
@@ -462,6 +603,13 @@ impl App {
                         }
                         if ui.button("Split into files…").clicked() {
                             self.split = Some(Split::new(&self.ed));
+                        }
+                        ui.separator();
+                        if ui.button("Crop or resize…").clicked() {
+                            self.crop = Some(crate::pageops::CropDialog::new());
+                        }
+                        if ui.button("Page numbers, headers and watermark…").clicked() {
+                            self.stamp = Some(crate::pageops::StampDialog::new());
                         }
                     });
                 }
@@ -664,6 +812,12 @@ impl eframe::App for App {
         if ctx.input(|i| i.viewport().close_requested()) && !self.closing {
             self.ed.commit_edits();
             self.ed.commit();
+            // Ask about the active tab first, then any other tab with changes.
+            if !self.ed.needs_save()
+                && let Some(i) = self.other_dirty_tab()
+            {
+                self.switch_tab(i);
+            }
             if self.ed.needs_save() {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
                 self.ask_save = Some(Pending::Quit);
@@ -677,6 +831,9 @@ impl eframe::App for App {
         self.update_title(&ctx);
 
         egui::Panel::top("top-bar").frame(egui::Frame::new().fill(p.bg).inner_margin(Margin::symmetric(6, 4))).show(ui, |ui| self.top_bar(ui));
+        if self.tabs.len() > 1 {
+            egui::Panel::top("tab-bar").frame(egui::Frame::new().fill(p.bg).inner_margin(Margin::symmetric(8, 2))).show(ui, |ui| self.tab_bar(ui));
+        }
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg)).show(ui, |ui| {
             let style = theme::dock_style(ui.ctx());
             let dock = if self.ed.editing { &mut self.dock } else { &mut self.view_dock };
@@ -701,6 +858,37 @@ impl eframe::App for App {
             && !dialogs::combine(&ctx, &mut self.ed, c)
         {
             self.combine = None;
+        }
+        if let Some(d) = &mut self.crop
+            && !crate::pageops::crop_window(&ctx, &mut self.ed, d)
+        {
+            self.crop = None;
+        }
+        if let Some(d) = &mut self.stamp
+            && !crate::pageops::stamp_window(&ctx, &mut self.ed, d)
+        {
+            self.stamp = None;
+        }
+        if let Some(d) = &mut self.compress
+            && !crate::pageops::compress_window(&ctx, &mut self.ed, d)
+        {
+            self.compress = None;
+        }
+        if let Some(d) = &mut self.export
+            && !crate::pageops::export_window(&ctx, &mut self.ed, d)
+        {
+            self.export = None;
+        }
+        if let Some(d) = &mut self.images {
+            let (open, made) = crate::pageops::images_window(&ctx, d);
+            if !open {
+                self.images = None;
+            }
+            if let Some(doc) = made {
+                self.tab_for_opening();
+                self.ed.open_untitled(doc);
+                self.ed.reset_view_caches();
+            }
         }
         if let Some(s) = &mut self.split
             && !dialogs::split(&ctx, &mut self.ed, s)

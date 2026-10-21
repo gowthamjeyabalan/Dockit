@@ -22,7 +22,7 @@ fn backdrop(ctx: &egui::Context) -> Color32 {
 }
 
 /// A modal window. Returns the closure's result and whether it should close (Escape or click outside).
-fn modal<R>(ctx: &egui::Context, id: &str, width: f32, add: impl FnOnce(&mut Ui) -> R) -> (R, bool) {
+pub(crate) fn modal<R>(ctx: &egui::Context, id: &str, width: f32, add: impl FnOnce(&mut Ui) -> R) -> (R, bool) {
     let resp = egui::Modal::new(egui::Id::new(id)).frame(frame(ctx)).backdrop_color(backdrop(ctx)).show(ctx, |ui| {
         ui.set_width(width);
         add(ui)
@@ -31,18 +31,18 @@ fn modal<R>(ctx: &egui::Context, id: &str, width: f32, add: impl FnOnce(&mut Ui)
     (resp.inner, close)
 }
 
-fn title(ui: &mut Ui, text: impl Into<String>) {
+pub(crate) fn title(ui: &mut Ui, text: impl Into<String>) {
     ui.label(theme::semibold(text).size(15.0));
     ui.add_space(2.0);
 }
 
-fn primary(ui: &mut Ui, text: &str, enabled: bool) -> bool {
+pub(crate) fn primary(ui: &mut Ui, text: &str, enabled: bool) -> bool {
     let p = pal(ui.ctx());
     let b = egui::Button::new(theme::semibold(text).color(Color32::WHITE)).fill(p.accent).min_size(vec2(84.0, 0.0));
     ui.add_enabled(enabled, b).clicked()
 }
 
-fn secondary_button(ui: &mut Ui, text: &str) -> bool {
+pub(crate) fn secondary_button(ui: &mut Ui, text: &str) -> bool {
     ui.add(egui::Button::new(text).min_size(vec2(76.0, 0.0))).clicked()
 }
 

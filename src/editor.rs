@@ -354,6 +354,17 @@ impl File {
         self.cached(i, |c| &mut c.glyphs, |p| Rc::new(p.glyphs())).unwrap_or_default()
     }
 
+    /// Page sizes or boxes changed: lay the pages out again.
+    pub fn refresh_sizes(&mut self) {
+        self.relayout();
+    }
+
+    /// Use a rewritten document (compressed) from now on.
+    pub fn replace_doc(&mut self, doc: Doc) {
+        self.doc = doc;
+        self.relayout();
+    }
+
     /// A second, independent copy of the current document (for copying pages within it).
     pub fn snapshot(&self) -> Option<Doc> {
         Doc::open(self.history[self.at].clone(), self.password.as_deref()).ok()
@@ -569,6 +580,17 @@ impl Editor {
         self.fit = Some(true);
         self.needs_commit = false;
         self.epoch += 1;
+    }
+
+    /// Open a document that exists only in memory (made from images), not yet saved.
+    pub fn open_untitled(&mut self, doc: Doc) {
+        match doc.save() {
+            Ok(bytes) => {
+                self.file = Some(File::new(doc, bytes, None, None));
+                self.after_open();
+            }
+            Err(e) => self.error = Some(e),
+        }
     }
 
     pub fn close(&mut self) {
