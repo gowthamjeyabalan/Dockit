@@ -1040,7 +1040,7 @@ fn start_drag(ed: &mut Editor, at: Option<(usize, Map)>, start: Pos2, sel_bounds
             Some(Drag::Band { page, from: start })
         }
         Tool::Rect | Tool::Ellipse | Tool::Line | Tool::Arrow | Tool::Measure => Some(Drag::Shape { page, from: start }),
-        Tool::TextBox => Some(Drag::Box { page, from: start }),
+        Tool::TextBox | Tool::Redact => Some(Drag::Box { page, from: start }),
         Tool::Callout => Some(Drag::Callout { page, from: start }),
         Tool::Field => {
             ed.commit_edits();
@@ -1130,8 +1130,13 @@ fn preview(ui: &Ui, ed: &Editor, maps: &HashMap<usize, Map>, pos: Pos2, mods: eg
         }
         Drag::Box { from, .. } => {
             let r = Rect::from_two_pos(*from, pos);
-            painter.rect_filled(r, 0.0, p.accent.gamma_multiply(0.08));
-            painter.rect_stroke(r, 0.0, accent, StrokeKind::Inside);
+            if ed.tool == Tool::Redact {
+                painter.rect_filled(r, 0.0, Color32::from_black_alpha(90));
+                painter.rect_stroke(r, 0.0, Stroke::new(1.5, p.danger), StrokeKind::Inside);
+            } else {
+                painter.rect_filled(r, 0.0, p.accent.gamma_multiply(0.08));
+                painter.rect_stroke(r, 0.0, accent, StrokeKind::Inside);
+            }
         }
         Drag::Callout { page, from } => {
             let Some(m) = maps.get(page) else { return };
@@ -1344,6 +1349,11 @@ fn finish_drag(ed: &mut Editor, d: Drag, maps: &HashMap<usize, Map>, pos: Pos2, 
             let u = m.user_rect(r);
             match ed.tool {
                 Tool::Field => ed.add_field(page, u),
+                Tool::Redact => {
+                    if r.width() >= 6.0 && r.height() >= 6.0 {
+                        ed.add_redaction(page, u);
+                    }
+                }
                 _ => ed.begin_text_box(page, u, None),
             }
         }

@@ -128,7 +128,7 @@ fn winansi(c: char) -> Option<u8> {
 }
 
 /// A string literal for text in a standard font.
-fn pdf_literal(s: &str) -> String {
+pub fn pdf_literal(s: &str) -> String {
     let mut out = String::from("(");
     for c in s.chars() {
         let b = winansi(c).unwrap_or(b'?');
@@ -185,6 +185,11 @@ fn appearance(bbox: [f32; 4], content: String, fonts: &[(&str, Object)]) -> Stre
     let mut s = Stream::new(d, content.into_bytes());
     let _ = s.compress();
     s
+}
+
+/// A form XObject in its own coordinates (bbox), with Helvetica available as /Helv.
+pub fn form_xobject(bbox: [f32; 4], content: String) -> Stream {
+    appearance(bbox, content, &[("Helv", helvetica())])
 }
 
 // ── measuring text ──
@@ -825,6 +830,14 @@ impl Update {
         let sid = states.get(state).and_then(Object::as_reference).ok()?;
         let s = self.doc.get_object(sid).and_then(Object::as_stream).ok()?.clone();
         Some((sid, s))
+    }
+
+    /// Mark the form as holding signatures that must be kept intact (SigFlags 3).
+    pub fn set_sig_flags(&mut self) -> Result<(), String> {
+        let (id, mut form) = self.form()?;
+        form.set("SigFlags", Object::Integer(3));
+        self.put(id, Object::Dictionary(form));
+        Ok(())
     }
 
     /// Take the form out of the document (after flattening, its fields no longer exist).

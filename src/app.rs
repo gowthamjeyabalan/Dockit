@@ -97,6 +97,8 @@ pub struct App {
     crop: Option<crate::pageops::CropDialog>,
     stamp: Option<crate::pageops::StampDialog>,
     compress: Option<crate::pageops::CompressDialog>,
+    security: Option<crate::security::SecurityDialog>,
+    sign: Option<crate::sign::SignDialog>,
     export: Option<crate::pageops::ExportDialog>,
     images: Option<crate::pageops::ImagesDialog>,
 }
@@ -140,6 +142,8 @@ impl App {
             crop: None,
             stamp: None,
             compress: None,
+            security: None,
+            sign: None,
             export: None,
             images: None,
         }
@@ -307,7 +311,7 @@ impl App {
     }
 
     fn modal_open(&self) -> bool {
-        self.crop.is_some() || self.stamp.is_some() || self.compress.is_some() || self.export.is_some() || self.images.is_some() || self.ask_save.is_some() || self.combine.is_some() || self.split.is_some() || self.pad.is_some() || self.ed.password.is_some() || self.ed.error.is_some()
+        self.crop.is_some() || self.stamp.is_some() || self.compress.is_some() || self.security.is_some() || self.sign.is_some() || self.export.is_some() || self.images.is_some() || self.ask_save.is_some() || self.combine.is_some() || self.split.is_some() || self.pad.is_some() || self.ed.password.is_some() || self.ed.error.is_some()
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -537,6 +541,13 @@ impl App {
                     self.compress = Some(crate::pageops::CompressDialog::new());
                 }
                 ui.separator();
+                if ui.add_enabled(has, egui::Button::new("Password and permissions…")).clicked() {
+                    self.security = Some(crate::security::SecurityDialog::new(&self.ed));
+                }
+                if ui.add_enabled(has, egui::Button::new("Sign digitally…")).clicked() {
+                    self.sign = Some(crate::sign::SignDialog::new(&self.ed, None));
+                }
+                ui.separator();
                 if ui.button("Quit").clicked() {
                     self.request(ui.ctx(), Pending::Quit);
                 }
@@ -568,6 +579,21 @@ impl App {
                         if self.ed.can_paste() && ui.add(egui::Button::new("Paste").shortcut_text("Ctrl+V")).clicked() {
                             let page = self.ed.current;
                             self.ed.paste(page);
+                        }
+                        let marks = self.ed.redaction_marks().len();
+                        if marks > 0 {
+                            ui.separator();
+                            if ui.button(format!("Apply {}…", crate::editor::plural(marks, "redaction", "redactions"))).clicked()
+                                && rfd::MessageDialog::new()
+                                    .set_title("Apply redactions")
+                                    .set_description("Everything under the marks will be removed from the document for good once you save. Apply now?")
+                                    .set_level(rfd::MessageLevel::Warning)
+                                    .set_buttons(rfd::MessageButtons::YesNo)
+                                    .show()
+                                    == rfd::MessageDialogResult::Yes
+                            {
+                                self.ed.apply_redactions();
+                            }
                         }
                         ui.separator();
                         if ui.button("Change signature…").clicked() {
@@ -852,6 +878,7 @@ impl eframe::App for App {
         // Windows asked for from panels.
         match self.ed.request.take() {
             Some(Request::Combine) => self.combine = Some(Combine::new(&self.ed)),
+            Some(Request::SignDigitally(field)) => self.sign = Some(crate::sign::SignDialog::new(&self.ed, field)),
             None => {}
         }
         if self.ed.signature_dialog {
@@ -877,6 +904,16 @@ impl eframe::App for App {
             && !crate::pageops::compress_window(&ctx, &mut self.ed, d)
         {
             self.compress = None;
+        }
+        if let Some(d) = &mut self.security
+            && !crate::security::security_window(&ctx, &mut self.ed, d)
+        {
+            self.security = None;
+        }
+        if let Some(d) = &mut self.sign
+            && !crate::sign::sign_window(&ctx, &mut self.ed, d)
+        {
+            self.sign = None;
         }
         if let Some(d) = &mut self.export
             && !crate::pageops::export_window(&ctx, &mut self.ed, d)

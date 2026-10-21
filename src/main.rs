@@ -15,12 +15,15 @@ mod mark;
 mod pageops;
 mod panels;
 mod pdf;
+mod redact;
+mod security;
+mod sign;
 mod theme;
 
 /// Every tool, in the order the Tools panel lists them (used for keyboard shortcuts).
-pub fn panels_tools() -> [editor::Tool; 16] {
+pub fn panels_tools() -> [editor::Tool; 17] {
     use editor::Tool::*;
-    [Select, Text, Image, Rect, Ellipse, Line, Highlight, Note, Ink, Stamp, Arrow, TextBox, Callout, Measure, Field, Sign]
+    [Select, Text, Image, Rect, Ellipse, Line, Highlight, Note, Ink, Stamp, Arrow, TextBox, Callout, Measure, Field, Redact, Sign]
 }
 
 fn main() -> eframe::Result<()> {

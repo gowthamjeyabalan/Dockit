@@ -99,7 +99,10 @@ pub fn password(ctx: &egui::Context, ed: &mut Editor) {
     let mut cancel = false;
     let (_, close) = modal(ctx, "password", 340.0, |ui| {
         title(ui, format!("{name} is protected"));
-        ui.label(theme::secondary(ui, "Enter the password to open it."));
+        ui.label(theme::secondary(
+            ui,
+            if ask.owner { "Its author restricted changes. Enter the owner password to edit it." } else { "Enter the password to open it." },
+        ));
         ui.add_space(8.0);
         let resp = ui.add(egui::TextEdit::singleline(&mut ask.text).password(true).desired_width(f32::INFINITY).hint_text("Password"));
         if !resp.has_focus() && ask.text.is_empty() {
@@ -113,7 +116,7 @@ pub fn password(ctx: &egui::Context, ed: &mut Editor) {
         }
         ui.add_space(12.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if primary(ui, "Open", !ask.text.is_empty()) {
+            if primary(ui, if ask.owner { "Unlock" } else { "Open" }, !ask.text.is_empty()) {
                 submit = true;
             }
             if secondary_button(ui, "Cancel") {
@@ -123,7 +126,16 @@ pub fn password(ctx: &egui::Context, ed: &mut Editor) {
     });
     if submit && !ask.text.is_empty() {
         let ask = ed.password.take().unwrap();
+        let owner = ask.owner;
         ed.open_bytes(&ask.path, ask.bytes, Some(ask.text));
+        // Unlocked for editing: go straight on into the editor if the password gave the right.
+        if owner && let Some(f) = &ed.file {
+            if crate::security::Allow::from_bits(f.doc.permissions()).edit {
+                ed.set_editing(true);
+            } else if ed.password.is_none() {
+                ed.error = Some("That password opens the document but does not allow changes. The owner password is needed.".into());
+            }
+        }
     } else if cancel || close {
         ed.password = None;
     }

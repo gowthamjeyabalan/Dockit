@@ -51,6 +51,7 @@ pub const ANNOT_STAMP: i32 = 13;
 pub const ANNOT_INK: i32 = 15;
 pub const ANNOT_POPUP: i32 = 16;
 pub const ANNOT_WIDGET: i32 = 20;
+pub const ANNOT_REDACT: i32 = 28;
 
 pub const FIELD_PUSHBUTTON: i32 = 1;
 pub const FIELD_CHECKBOX: i32 = 2;
@@ -107,6 +108,17 @@ fn read_narrow(f: impl Fn(*mut std::ffi::c_char, usize) -> usize) -> String {
 
 // ── documents ──
 
+/// A signature as the file stores it.
+pub struct RawSignature {
+    /// The CMS blob (with any zero padding).
+    pub contents: Vec<u8>,
+    pub byte_range: Vec<i32>,
+    pub reason: String,
+    /// PDF date string.
+    pub time: String,
+}
+
+#[derive(Debug)]
 pub enum OpenError {
     Password,
     Failed(String),
@@ -281,6 +293,34 @@ impl Doc {
         let flags = if self.encrypted() { SAVE_REMOVE_SECURITY } else { SAVE_NO_INCREMENTAL };
         let ok = unsafe { lib().FPDF_SaveAsCopy(self.h, &mut w.fw, flags) };
         if ok != 0 { Ok(w.out) } else { Err("PDFium could not write the document.".into()) }
+    }
+
+    /// The document's digital signatures, as stored.
+    pub fn signatures(&self) -> Vec<RawSignature> {
+        let l = lib();
+        let n = unsafe { l.FPDF_GetSignatureCount(self.h) }.max(0);
+        (0..n)
+            .filter_map(|i| unsafe {
+                let s = l.FPDF_GetSignatureObject(self.h, i);
+                if s.is_null() {
+                    return None;
+                }
+                let len = l.FPDFSignatureObj_GetContents(s, null_mut(), 0) as usize;
+                let mut contents = vec![0u8; len];
+                l.FPDFSignatureObj_GetContents(s, contents.as_mut_ptr() as *mut c_void, len as c_ulong);
+                let count = l.FPDFSignatureObj_GetByteRange(s, null_mut(), 0) as usize;
+                let mut byte_range = vec![0 as c_int; count];
+                l.FPDFSignatureObj_GetByteRange(s, byte_range.as_mut_ptr(), count as c_ulong);
+                let reason = read_wide(|b, n| l.FPDFSignatureObj_GetReason(s, b as *mut c_void, n));
+                let time = read_narrow(|b, n| l.FPDFSignatureObj_GetTime(s, b, n as c_ulong) as usize);
+                Some(RawSignature { contents, byte_range, reason, time })
+            })
+            .collect()
+    }
+
+    /// The permission word (P) for how the document was opened; all bits set without restrictions.
+    pub fn permissions(&self) -> u32 {
+        unsafe { lib().FPDF_GetDocPermissions(self.h) as u32 }
     }
 
     pub fn encrypted(&self) -> bool {
@@ -575,9 +615,20 @@ pub fn annot_name(subtype: i32) -> &'static str {
         ANNOT_POPUP => "Pop-up",
         17 => "Attachment",
         ANNOT_WIDGET => "Form field",
-        28 => "Redaction",
+        ANNOT_REDACT => "Redaction mark",
         _ => "Annotation",
     }
+}
+
+/// A character with the text object it is drawn by.
+#[derive(Clone, Copy, Debug)]
+pub struct Char {
+    pub obj: usize,
+    pub ch: char,
+    /// Where its baseline starts, in user space.
+    pub origin: (f32, f32),
+    /// The glyph's own box (empty for a word gap).
+    pub rect: [f32; 4],
 }
 
 /// One character from the page's text layer.
@@ -658,6 +709,77 @@ impl<'d> Page<'d> {
     }
 
     // ── page objects ──
+
+    /// Every character of the text layer that belongs to a text object, in reading order, with
+    /// the object it comes from.
+    pub fn chars(&self) -> Vec<Char> {
+        let l = lib();
+        let mut out = Vec::new();
+        let n_obj = unsafe { l.FPDFPage_CountObjects(self.h) }.max(0) as usize;
+        let index: std::collections::HashMap<usize, usize> = (0..n_obj).map(|i| (self.obj(i) as usize, i)).collect();
+        unsafe {
+            let tp = l.FPDFText_LoadPage(self.h);
+            if tp.is_null() {
+                return out;
+            }
+            let mut last: Option<usize> = None;
+            for i in 0..l.FPDFText_CountChars(tp).max(0) {
+                let ch = char::from_u32(l.FPDFText_GetUnicode(tp, i)).unwrap_or(char::REPLACEMENT_CHARACTER);
+                if l.FPDFText_IsGenerated(tp, i) == 1 {
+                    // Word gaps made by spacing rather than a space character still separate words.
+                    if let (' ', Some(obj)) = (ch, last) {
+                        out.push(Char { obj, ch, origin: (0.0, 0.0), rect: [0.0; 4] });
+                    }
+                    continue;
+                }
+                let o = l.FPDFText_GetTextObject(tp, i);
+                let Some(&obj) = index.get(&(o as usize)) else { continue };
+                last = Some(obj);
+                // The glyph's own box, not the line-height one, so neighbours are not caught.
+                let (mut x0, mut x1, mut y0, mut y1) = (0.0, 0.0, 0.0, 0.0);
+                l.FPDFText_GetCharBox(tp, i, &mut x0, &mut x1, &mut y0, &mut y1);
+                let (mut x, mut y) = (0.0, 0.0);
+                l.FPDFText_GetCharOrigin(tp, i, &mut x, &mut y);
+                out.push(Char { obj, ch, origin: (x as f32, y as f32), rect: [x0 as f32, y0 as f32, x1 as f32, y1 as f32] });
+            }
+            l.FPDFText_ClosePage(tp);
+        }
+        out
+    }
+
+    /// An image object's pixels as RGBA, decoded but before any mask.
+    pub fn image_rgba(&self, i: usize) -> Option<(u32, u32, Vec<u8>)> {
+        let l = lib();
+        unsafe {
+            let bmp = l.FPDFImageObj_GetBitmap(self.obj(i));
+            if bmp.is_null() {
+                return None;
+            }
+            let (w, h, stride) = (l.FPDFBitmap_GetWidth(bmp), l.FPDFBitmap_GetHeight(bmp), l.FPDFBitmap_GetStride(bmp));
+            let format = l.FPDFBitmap_GetFormat(bmp);
+            let buf = l.FPDFBitmap_GetBuffer(bmp) as *const u8;
+            let mut out = Vec::new();
+            if !buf.is_null() && w > 0 && h > 0 {
+                let data = std::slice::from_raw_parts(buf, (stride * h) as usize);
+                out.reserve((w * h * 4) as usize);
+                for y in 0..h as usize {
+                    let row = &data[y * stride as usize..];
+                    for x in 0..w as usize {
+                        let px = match format {
+                            1 => [row[x], row[x], row[x], 255],
+                            2 => [row[x * 3 + 2], row[x * 3 + 1], row[x * 3], 255],
+                            3 => [row[x * 4 + 2], row[x * 4 + 1], row[x * 4], 255],
+                            4 => [row[x * 4 + 2], row[x * 4 + 1], row[x * 4], row[x * 4 + 3]],
+                            _ => [0, 0, 0, 255],
+                        };
+                        out.extend_from_slice(&px);
+                    }
+                }
+            }
+            l.FPDFBitmap_Destroy(bmp);
+            (!out.is_empty()).then_some((w as u32, h as u32, out))
+        }
+    }
 
     pub fn objects(&self) -> Vec<Obj> {
         let l = lib();
@@ -1040,10 +1162,22 @@ impl<'d> Page<'d> {
                     } else {
                         Vec::new()
                     };
+                    let mut value = read_wide(|b, n| l.FPDFAnnot_GetFormFieldValue(form, a, b, n));
+                    if kind == FIELD_SIGNATURE && value.is_empty() {
+                        // PDFium gives no value for signatures: a signed field has a /V (here or on its parent).
+                        let parent = l.FPDFAnnot_GetLinkedAnnot(a, "Parent");
+                        let signed = l.FPDFAnnot_HasKey(a, "V") != 0 || (!parent.is_null() && l.FPDFAnnot_HasKey(parent, "V") != 0);
+                        if !parent.is_null() {
+                            l.FPDFPage_CloseAnnot(parent);
+                        }
+                        if signed {
+                            value = "Signed".into();
+                        }
+                    }
                     Field {
                         kind,
                         name: read_wide(|b, n| l.FPDFAnnot_GetFormFieldName(form, a, b, n)),
-                        value: read_wide(|b, n| l.FPDFAnnot_GetFormFieldValue(form, a, b, n)),
+                        value,
                         checked: matches!(kind, FIELD_CHECKBOX | FIELD_RADIO) && l.FPDFAnnot_IsChecked(form, a) != 0,
                         flags: l.FPDFAnnot_GetFormFieldFlags(form, a),
                         options,

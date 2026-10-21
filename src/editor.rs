@@ -36,6 +36,7 @@ pub enum Tool {
     Callout,
     Measure,
     Field,
+    Redact,
     Sign,
 }
 
@@ -57,6 +58,7 @@ impl Tool {
             Tool::Callout => "Callout",
             Tool::Measure => "Measure",
             Tool::Field => "Form field",
+            Tool::Redact => "Redact",
             Tool::Sign => "Sign",
         }
     }
@@ -79,6 +81,7 @@ impl Tool {
             Tool::Callout => Key::C,
             Tool::Measure => Key::M,
             Tool::Field => Key::F,
+            Tool::Redact => Key::B,
             Tool::Sign => Key::G,
         }
     }
@@ -99,6 +102,7 @@ impl Tool {
             Tool::Callout => "Drag from the spot to point at to where the text should go, then type.",
             Tool::Measure => "Drag between two points to measure the distance. Hold Shift for steps of 45°.",
             Tool::Field => "Drag to draw a new field, or click an existing one to select, move or rename it.",
+            Tool::Redact => "Drag over what should be removed. Marks can be checked and changed; Apply removes everything under them for good.",
             Tool::Sign => "Click to place your signature.",
         }
     }
@@ -155,6 +159,8 @@ pub struct Style {
     /// Real distance per page distance (1 for 1:1, 100 for a 1:100 drawing).
     pub scale: f32,
     pub field: NewField,
+    /// The certificate last used to sign digitally.
+    pub pfx: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -217,6 +223,7 @@ impl Default for Style {
             unit: Unit::Mm,
             scale: 1.0,
             field: NewField::Text,
+            pfx: None,
         }
     }
 }
@@ -338,6 +345,8 @@ pub struct PasswordAsk {
     pub bytes: Vec<u8>,
     pub text: String,
     pub wrong: bool,
+    /// Asking for the owner password, to edit a document whose author restricted changes.
+    pub owner: bool,
 }
 
 #[derive(Default)]
@@ -352,6 +361,10 @@ pub struct File {
     pub doc: Doc,
     pub path: Option<PathBuf>,
     pub password: Option<String>,
+    /// How it is protected when saved.
+    pub security: crate::security::Security,
+    /// Its digital signatures, checked against the file as it was opened.
+    pub signatures: Vec<crate::sign::SigInfo>,
     history: Vec<Vec<u8>>,
     at: usize,
     saved_at: Option<usize>,
@@ -366,7 +379,7 @@ impl File {
     fn new(doc: Doc, bytes: Vec<u8>, path: Option<PathBuf>, password: Option<String>) -> File {
         let saved = path.is_some().then_some(0);
         let mut f =
-            File { doc, path, password, history: vec![bytes], at: 0, saved_at: saved, sizes: Vec::new(), revs: Vec::new(), cache: RefCell::new(Vec::new()) };
+            File { doc, path, password, security: Default::default(), signatures: Vec::new(), history: vec![bytes], at: 0, saved_at: saved, sizes: Vec::new(), revs: Vec::new(), cache: RefCell::new(Vec::new()) };
         f.relayout();
         f
     }
@@ -384,6 +397,24 @@ impl File {
 
     pub fn dirty(&self) -> bool {
         self.saved_at != Some(self.at)
+    }
+
+    /// Something to save that is not in the history (such as protection).
+    pub fn mark_unsaved(&mut self) {
+        self.saved_at = None;
+    }
+
+    /// The document was protected and has just been rewritten without its encryption (to change
+    /// it directly): keep it protected the same way when it is saved.
+    fn keep_protection(&mut self, permissions: u32) {
+        if self.security == crate::security::Security::Keep {
+            let pw = self.password.clone().unwrap_or_default();
+            self.security = crate::security::Security::Protect(crate::security::Protection {
+                open: pw.clone(),
+                owner: pw,
+                allow: crate::security::Allow::from_bits(permissions),
+            });
+        }
     }
 
     pub fn page_count(&self) -> usize {
@@ -542,6 +573,8 @@ pub struct Editor {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Request {
     Combine,
+    /// Sign with a certificate, in this signature field (page, annotation) if given.
+    SignDigitally(Option<(usize, usize)>),
 }
 
 impl Default for Editor {
@@ -617,18 +650,33 @@ impl Editor {
         match Doc::open(bytes.clone(), password.as_deref()) {
             Ok(doc) => {
                 self.password = None;
+                let signatures = crate::sign::verify_all(&bytes, &doc);
                 let (doc, bytes) = settle_appearances(doc, bytes, password.as_deref());
-                self.file = Some(File::new(doc, bytes, Some(path.to_path_buf()), password));
+                let mut file = File::new(doc, bytes, Some(path.to_path_buf()), password);
+                file.signatures = signatures;
+                self.file = Some(file);
                 self.after_open();
                 self.recent.retain(|p| p != path);
                 self.recent.insert(0, path.to_path_buf());
                 self.recent.truncate(10);
                 let n = self.file.as_ref().map_or(0, |f| f.page_count());
-                self.say(format!("Opened {}, {}", path.file_name().unwrap_or_default().to_string_lossy(), plural(n, "page", "pages")));
+                let mut msg = format!("Opened {}, {}", path.file_name().unwrap_or_default().to_string_lossy(), plural(n, "page", "pages"));
+                if let Some(f) = &self.file
+                    && !f.signatures.is_empty()
+                {
+                    let bad = f.signatures.iter().filter(|s| !s.valid).count();
+                    let names: Vec<&str> = f.signatures.iter().map(|s| s.signer.as_str()).filter(|n| !n.is_empty()).collect();
+                    msg = if bad > 0 {
+                        format!("{msg}. Warning: {} not valid", plural(bad, "signature is", "signatures are"))
+                    } else {
+                        format!("{msg}. Signed by {}, valid", names.join(", "))
+                    };
+                }
+                self.say(msg);
             }
             Err(OpenError::Password) => {
                 let wrong = password.is_some();
-                self.password = Some(PasswordAsk { path: path.to_path_buf(), bytes, text: String::new(), wrong });
+                self.password = Some(PasswordAsk { path: path.to_path_buf(), bytes, text: String::new(), wrong, owner: false });
             }
             Err(OpenError::Failed(msg)) => self.error = Some(format!("Could not open {}. {msg}", path.display())),
         }
@@ -636,6 +684,15 @@ impl Editor {
 
     /// Switch between reading and editing. Leaving editing finishes anything being typed.
     pub fn set_editing(&mut self, on: bool) {
+        if on && !self.editing && let Some(f) = &self.file && f.doc.encrypted() && !crate::security::Allow::from_bits(f.doc.permissions()).edit {
+            // The author restricted changes: the owner password unlocks them.
+            if let Some(path) = f.path.clone() {
+                self.password = Some(PasswordAsk { path, bytes: f.history[0].clone(), text: String::new(), wrong: false, owner: true });
+            } else {
+                self.error = Some("The author of this document does not allow changes to it.".into());
+            }
+            return;
+        }
         if !on {
             self.commit_edits();
             self.clear_selection();
@@ -645,6 +702,9 @@ impl Editor {
         if self.editing != on {
             // The two layouts have different widths: refit the page.
             self.fit = Some(true);
+            if on && self.file.as_ref().is_some_and(|f| !f.signatures.is_empty()) {
+                self.say("This document is digitally signed. Any change you save will make its signatures invalid.");
+            }
         }
         self.editing = on;
     }
@@ -697,7 +757,13 @@ impl Editor {
                 }
             }
         };
-        let bytes = match f.doc.save() {
+        use crate::security::Security;
+        let bytes = match &f.security {
+            Security::Keep => f.doc.save(),
+            Security::Remove => f.doc.save_plain(),
+            Security::Protect(p) => f.doc.save_plain().and_then(|b| crate::security::encrypt(&b, p)),
+        };
+        let bytes = match bytes {
             Ok(b) => b,
             Err(e) => {
                 self.error = Some(e);
@@ -934,6 +1000,7 @@ impl Editor {
     pub fn surgery_with(&mut self, page: usize, plan: impl FnOnce(&PageModel) -> Result<SurgeryPlan, String>) -> bool {
         let Some(f) = &self.file else { return false };
         let was_encrypted = f.doc.encrypted();
+        let permissions = f.doc.permissions();
         let result = PageModel::load(f, page).and_then(|m| {
             let (edits, images, extra) = plan(&m)?;
             let new = content::edit(&m.data.content, &m.parsed, &m.starts, &edits)?;
@@ -958,8 +1025,8 @@ impl Editor {
         // The page's object list may have changed; the other pages are as they were.
         f.invalidate(page);
         if was_encrypted {
-            f.password = None;
-            self.say("This file was password protected. It is saved without protection from now on.");
+            f.keep_protection(permissions);
+            self.say("This file is password protected. It stays protected with the same password when you save it.");
         }
         self.needs_commit = true;
         true
@@ -1337,6 +1404,7 @@ impl Editor {
     pub fn file_update<R>(&mut self, pages: &[usize], change: impl FnOnce(&mut annots::Update) -> Result<R, String>) -> Option<R> {
         let f = self.file.as_ref()?;
         let was_encrypted = f.doc.encrypted();
+        let permissions = f.doc.permissions();
         let result = f.doc.save_plain().and_then(annots::Update::load).and_then(|mut u| {
             let r = change(&mut u)?;
             Ok((u.finish()?, r))
@@ -1358,8 +1426,8 @@ impl Editor {
             f.invalidate(p);
         }
         if was_encrypted {
-            f.password = None;
-            self.say("This file was password protected. It is saved without protection from now on.");
+            f.keep_protection(permissions);
+            self.say("This file is password protected. It stays protected with the same password when you save it.");
         }
         self.needs_commit = true;
         Some(r)

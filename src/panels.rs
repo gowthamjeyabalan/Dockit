@@ -20,7 +20,7 @@ const SECTIONS: [(&str, &[Tool]); 5] = [
     ("SHAPES", &[Tool::Rect, Tool::Ellipse, Tool::Line]),
     ("REVIEW", &[Tool::Highlight, Tool::Note, Tool::Ink, Tool::Stamp, Tool::Arrow, Tool::TextBox, Tool::Callout, Tool::Measure]),
     ("FORMS", &[Tool::Field]),
-    ("SIGN", &[Tool::Sign]),
+    ("PROTECT", &[Tool::Redact, Tool::Sign]),
 ];
 
 pub const STAMPS: [&str; 6] = ["Approved", "Draft", "Confidential", "Final", "Reviewed", "Not approved"];
@@ -197,6 +197,30 @@ fn tool_options(ui: &mut Ui, ed: &mut Editor) {
                 ui.label(theme::secondary(ui, "For scale drawings: 1 : 100 means 1 mm on the page is 100 mm in reality."));
             }
         }
+        Tool::Redact => {
+            theme::heading(ui, "REDACTION");
+            let marks = ed.redaction_marks().len();
+            ui.label(theme::secondary(
+                ui,
+                if marks == 0 { "No areas marked yet.".to_string() } else { format!("{} marked. Review them, then apply.", plural(marks, "area", "areas")) },
+            ));
+            let confirm_id = egui::Id::new("redact-confirm");
+            let confirming = ui.data(|d| d.get_temp::<bool>(confirm_id)).unwrap_or(false);
+            if confirming {
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Apply redactions").color(pal(ui.ctx()).danger)).clicked() {
+                        ui.data_mut(|d| d.remove::<bool>(confirm_id));
+                        ed.apply_redactions();
+                    }
+                    if ui.button("Cancel").clicked() {
+                        ui.data_mut(|d| d.remove::<bool>(confirm_id));
+                    }
+                });
+                ui.label(RichText::new("Everything under the marks will be removed for good once you save.").color(pal(ui.ctx()).danger));
+            } else if ui.add_enabled(marks > 0, egui::Button::new("Apply redactions…")).clicked() {
+                ui.data_mut(|d| d.insert_temp(confirm_id, true));
+            }
+        }
         Tool::Field => {
             theme::heading(ui, "NEW FIELD");
             egui::ComboBox::from_id_salt("field-kind").selected_text(s.field.label()).show_ui(ui, |ui| {
@@ -222,6 +246,11 @@ fn tool_options(ui: &mut Ui, ed: &mut Editor) {
             }
             if ui.button(if ed.signature.is_some() { "Change signature…" } else { "Create signature…" }).clicked() {
                 ed.signature_dialog = true;
+            }
+            ui.add_space(4.0);
+            ui.label(theme::secondary(ui, "For a signature that proves who signed, use a certificate:"));
+            if ui.button("Sign digitally…").clicked() {
+                ed.request = Some(crate::editor::Request::SignDigitally(None));
             }
         }
     }
@@ -485,6 +514,7 @@ fn document_props(ui: &mut Ui, ed: &Editor) {
         ui.add_space(4.0);
         ui.label(theme::secondary(ui, "This document has form fields. Click a field to fill it in, or use the Form panel."));
     }
+    signatures_props(ui, f);
     ui.add_space(8.0);
     ui.label(theme::secondary(ui, "Select something on a page to see its properties."));
 }
@@ -537,6 +567,40 @@ fn annot_props(ui: &mut Ui, ed: &mut Editor, page: usize, index: usize) {
     }
 }
 
+/// Each digital signature and what checking it found.
+fn signatures_props(ui: &mut Ui, f: &crate::editor::File) {
+    if f.signatures.is_empty() {
+        return;
+    }
+    let p = pal(ui.ctx());
+    theme::heading(ui, "SIGNATURES");
+    for s in &f.signatures {
+        let who = if s.signer.is_empty() { "Unknown signer".to_string() } else { s.signer.clone() };
+        let (mark, color) = if s.valid { ("✔", p.accent_text) } else { ("✖", p.danger) };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(mark).color(color));
+            ui.label(theme::semibold(who));
+        });
+        if !s.time.is_empty() {
+            ui.label(theme::secondary(ui, format!("Signed {}", s.time)));
+        }
+        if !s.reason.is_empty() {
+            ui.label(theme::secondary(ui, format!("Reason: {}", s.reason)));
+        }
+        let status = match (s.valid, s.whole) {
+            (false, _) => "The signature does not match the document: it was changed or the signature is damaged.",
+            (true, true) => "The document has not changed since it was signed.",
+            (true, false) => "Valid for the version signed; the document was changed after signing.",
+        };
+        ui.label(RichText::new(status).color(if s.valid { p.text } else { p.danger }).size(12.0));
+        ui.label(theme::secondary(
+            ui,
+            if s.trusted { "The certificate is trusted by Windows." } else { "The certificate is not trusted on this computer (self-signed or unknown issuer)." },
+        ));
+        ui.add_space(4.0);
+    }
+}
+
 fn field_props(ui: &mut Ui, ed: &mut Editor, page: usize, index: usize, field: pdf::Field, rev: u64) {
     let p = pal(ui.ctx());
     theme::heading(ui, &field.kind_name().to_uppercase());
@@ -561,6 +625,9 @@ fn field_props(ui: &mut Ui, ed: &mut Editor, page: usize, index: usize, field: p
             ed.set_field_choices(page, index, &new);
         }
         ui.label(theme::secondary(ui, "One choice per line."));
+    }
+    if field.kind == pdf::FIELD_SIGNATURE && field.value.is_empty() && ui.button("Sign digitally…").clicked() {
+        ed.request = Some(crate::editor::Request::SignDigitally(Some((page, index))));
     }
     ui.add_space(4.0);
     ui.label(theme::secondary(ui, "With the Form field tool, drag the field to move it. With Select, click it to fill it in."));
@@ -1002,9 +1069,18 @@ pub fn form_ui(ui: &mut Ui, ed: &mut Editor) {
                     }
                     pdf::FIELD_SIGNATURE => {
                         ui.label(theme::secondary(ui, &name));
-                        if ui.button("Sign here").clicked() {
-                            ed.goto = Some(page);
-                            ed.place_signature(page, ((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0));
+                        if field.value.is_empty() {
+                            ui.horizontal(|ui| {
+                                if ui.button("Sign here").clicked() {
+                                    ed.goto = Some(page);
+                                    ed.place_signature(page, ((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0));
+                                }
+                                if ui.button("Sign digitally…").clicked() {
+                                    ed.request = Some(crate::editor::Request::SignDigitally(Some((page, index))));
+                                }
+                            });
+                        } else {
+                            ui.label("Signed");
                         }
                     }
                     _ => {
