@@ -22,7 +22,7 @@ pub enum Scope {
     Range,
 }
 
-fn scope_ui(ui: &mut Ui, scope: &mut Scope, range: &mut String, ed: &Editor) {
+pub(crate) fn scope_ui(ui: &mut Ui, scope: &mut Scope, range: &mut String, ed: &Editor) {
     let n = ed.selected_pages().len();
     ui.segmented(scope, &[(Scope::All, "All pages"), (Scope::Selected, if n > 1 { "Selected pages" } else { "This page" }), (Scope::Range, "Pages…")]);
     if *scope == Scope::Range {
@@ -30,7 +30,7 @@ fn scope_ui(ui: &mut Ui, scope: &mut Scope, range: &mut String, ed: &Editor) {
     }
 }
 
-fn scope_pages(ed: &Editor, scope: Scope, range: &str) -> Result<Vec<usize>, String> {
+pub(crate) fn scope_pages(ed: &Editor, scope: Scope, range: &str) -> Result<Vec<usize>, String> {
     let n = ed.file.as_ref().map_or(0, |f| f.page_count());
     match scope {
         Scope::All => Ok((0..n).collect()),

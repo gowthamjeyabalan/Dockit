@@ -365,6 +365,8 @@ pub struct File {
     pub security: crate::security::Security,
     /// Its digital signatures, checked against the file as it was opened.
     pub signatures: Vec<crate::sign::SigInfo>,
+    /// Names its autosaved copy.
+    pub uid: u64,
     history: Vec<Vec<u8>>,
     at: usize,
     saved_at: Option<usize>,
@@ -379,7 +381,14 @@ impl File {
     fn new(doc: Doc, bytes: Vec<u8>, path: Option<PathBuf>, password: Option<String>) -> File {
         let saved = path.is_some().then_some(0);
         let mut f =
-            File { doc, path, password, security: Default::default(), signatures: Vec::new(), history: vec![bytes], at: 0, saved_at: saved, sizes: Vec::new(), revs: Vec::new(), cache: RefCell::new(Vec::new()) };
+            File {
+                doc,
+                path,
+                password,
+                security: Default::default(),
+                signatures: Vec::new(),
+                uid: u64::from_le_bytes(crate::security::random_bytes(8).try_into().unwrap_or([7; 8])),
+                history: vec![bytes], at: 0, saved_at: saved, sizes: Vec::new(), revs: Vec::new(), cache: RefCell::new(Vec::new()) };
         f.relayout();
         f
     }
@@ -397,6 +406,16 @@ impl File {
 
     pub fn dirty(&self) -> bool {
         self.saved_at != Some(self.at)
+    }
+
+    /// The latest recorded state of the document (what autosave writes).
+    pub fn current_state(&self) -> Option<&[u8]> {
+        self.history.get(self.at).map(Vec::as_slice)
+    }
+
+    /// Which history state is current; changes whenever the document does.
+    pub fn state(&self) -> usize {
+        self.at + self.history.len() * 1_000_003
     }
 
     /// Something to save that is not in the history (such as protection).

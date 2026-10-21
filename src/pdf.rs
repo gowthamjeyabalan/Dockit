@@ -874,6 +874,22 @@ impl<'d> Page<'d> {
         }
     }
 
+    /// The page's text in reading order, as PDFium extracts it.
+    pub fn page_text(&self) -> String {
+        let l = lib();
+        unsafe {
+            let tp = l.FPDFText_LoadPage(self.h);
+            if tp.is_null() {
+                return String::new();
+            }
+            let n = l.FPDFText_CountChars(tp).max(0);
+            let mut buf = vec![0u16; n as usize + 1];
+            let got = l.FPDFText_GetText(tp, 0, n, buf.as_mut_ptr()).max(1) as usize;
+            l.FPDFText_ClosePage(tp);
+            String::from_utf16_lossy(&buf[..got - 1])
+        }
+    }
+
     /// The text of every object (None for non-text objects), read with one text page.
     pub fn texts(&self) -> Vec<Option<String>> {
         let l = lib();
@@ -937,6 +953,26 @@ impl<'d> Page<'d> {
         }
         self.touch();
         Some(self.object_count() - 1)
+    }
+
+    /// Invisible text (render mode 3), as a recognized-text layer over a scanned page: it can be
+    /// searched, selected and copied, but does not show.
+    pub fn add_hidden_text(&self, font: FPDF_FONT, size: f32, text: &str, m: [f32; 6]) -> bool {
+        let l = lib();
+        unsafe {
+            let o = l.FPDFPageObj_CreateTextObj(self.doc.h, font, size);
+            if o.is_null() {
+                return false;
+            }
+            let w = wide(text);
+            l.FPDFText_SetText(o, w.as_ptr());
+            let fm = FS_MATRIX { a: m[0], b: m[1], c: m[2], d: m[3], e: m[4], f: m[5] };
+            l.FPDFPageObj_SetMatrix(o, &fm);
+            l.FPDFTextObj_SetTextRenderMode(o, 3);
+            l.FPDFPage_InsertObject(self.h, o);
+        }
+        self.touch();
+        true
     }
 
     /// The crop box (l, b, r, t), or the media box when there is none.

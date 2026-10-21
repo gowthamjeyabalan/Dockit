@@ -99,6 +99,13 @@ pub struct App {
     compress: Option<crate::pageops::CompressDialog>,
     security: Option<crate::security::SecurityDialog>,
     sign: Option<crate::sign::SignDialog>,
+    ocr: Option<crate::ocr::OcrDialog>,
+    compare: Option<crate::compare::Compare>,
+    autosave: crate::recovery::Autosave,
+    setup: Option<crate::setup::SetupDialog>,
+    /// Files handed over by later launches (double-clicked in Explorer).
+    incoming: Option<std::sync::mpsc::Receiver<PathBuf>>,
+    recovery: Option<crate::recovery::RecoveryDialog>,
     export: Option<crate::pageops::ExportDialog>,
     images: Option<crate::pageops::ImagesDialog>,
 }
@@ -122,6 +129,7 @@ impl App {
         }
         let dock = settings.dock.filter(|_| settings.dock_version == DOCK_VERSION).unwrap_or_else(default_dock);
         let view_dock = settings.view_dock.filter(|_| settings.dock_version == DOCK_VERSION).unwrap_or_else(default_view_dock);
+        let broken_none = broken.is_none();
         App {
             ed,
             dock,
@@ -144,6 +152,17 @@ impl App {
             compress: None,
             security: None,
             sign: None,
+            ocr: None,
+            compare: None,
+            autosave: Default::default(),
+            setup: None,
+            incoming: broken_none.then(|| crate::setup::listen(cc.egui_ctx.clone())),
+            recovery: if broken_none {
+                let items = crate::recovery::orphans();
+                (!items.is_empty()).then_some(crate::recovery::RecoveryDialog { items })
+            } else {
+                None
+            },
             export: None,
             images: None,
         }
@@ -311,7 +330,7 @@ impl App {
     }
 
     fn modal_open(&self) -> bool {
-        self.crop.is_some() || self.stamp.is_some() || self.compress.is_some() || self.security.is_some() || self.sign.is_some() || self.export.is_some() || self.images.is_some() || self.ask_save.is_some() || self.combine.is_some() || self.split.is_some() || self.pad.is_some() || self.ed.password.is_some() || self.ed.error.is_some()
+        self.crop.is_some() || self.stamp.is_some() || self.compress.is_some() || self.security.is_some() || self.sign.is_some() || self.ocr.is_some() || self.recovery.is_some() || self.setup.is_some() || self.export.is_some() || self.images.is_some() || self.ask_save.is_some() || self.combine.is_some() || self.split.is_some() || self.pad.is_some() || self.ed.password.is_some() || self.ed.error.is_some()
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -548,6 +567,24 @@ impl App {
                     self.sign = Some(crate::sign::SignDialog::new(&self.ed, None));
                 }
                 ui.separator();
+                if ui.add_enabled(has, egui::Button::new("Compare with another version…")).clicked()
+                    && let Some(other) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_file()
+                    && let Some(f) = &self.ed.file
+                {
+                    match crate::compare::Compare::new(&f.doc, other) {
+                        Ok(c) => self.compare = Some(c),
+                        Err(e) => self.ed.error = Some(e),
+                    }
+                }
+                ui.separator();
+                if crate::setup::running_installed() {
+                    if ui.button("Choose default PDF app…").clicked() {
+                        crate::setup::open_default_apps();
+                    }
+                } else if ui.button("Install Dockit…").clicked() {
+                    self.setup = Some(crate::setup::SetupDialog::new());
+                }
+                ui.separator();
                 if ui.button("Quit").clicked() {
                     self.request(ui.ctx(), Pending::Quit);
                 }
@@ -636,6 +673,9 @@ impl App {
                         }
                         if ui.button("Page numbers, headers and watermark…").clicked() {
                             self.stamp = Some(crate::pageops::StampDialog::new());
+                        }
+                        if ui.button("Recognize text (OCR)…").clicked() {
+                            self.ocr = Some(crate::ocr::OcrDialog::new());
                         }
                         ui.separator();
                         if ui.button("Flatten comments and form fields").on_hover_text("Draw every comment, mark and form field into the pages so they can no longer be changed").clicked() {
@@ -914,6 +954,59 @@ impl eframe::App for App {
             && !crate::sign::sign_window(&ctx, &mut self.ed, d)
         {
             self.sign = None;
+        }
+        if let Some(d) = &mut self.ocr
+            && !crate::ocr::ocr_window(&ctx, &mut self.ed, d)
+        {
+            self.ocr = None;
+        }
+        if let Some(c) = &mut self.compare
+            && !crate::compare::compare_window(&ctx, self.ed.file.as_ref().map(|f| &f.doc), c)
+        {
+            self.compare = None;
+        }
+        if let Some(d) = &mut self.recovery {
+            use crate::recovery::RecoveryAction;
+            match crate::recovery::recovery_window(&ctx, d) {
+                Some(RecoveryAction::Open(list)) => {
+                    let opened: Vec<u64> = list.iter().map(|m| m.uid).collect();
+                    for m in &list {
+                        self.tab_for_opening();
+                        self.ed.open_recovered(m);
+                    }
+                    self.ed.reset_view_caches();
+                    if let Some(d) = &mut self.recovery {
+                        d.items.retain(|m| !opened.contains(&m.uid));
+                        if d.items.is_empty() {
+                            self.recovery = None;
+                        }
+                    }
+                }
+                Some(RecoveryAction::Later) => self.recovery = None,
+                None => {}
+            }
+        }
+
+        if let Some(d) = &mut self.setup
+            && !crate::setup::setup_window(&ctx, d)
+        {
+            self.setup = None;
+        }
+        let incoming: Vec<PathBuf> = self.incoming.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+        for path in incoming {
+            self.request(&ctx, Pending::OpenFile(path));
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+        }
+
+        // Keep copies of unsaved work, and drop them on a normal close.
+        if self.closing {
+            self.autosave.clear();
+        } else {
+            self.autosave.tick(std::iter::once(&self.ed).chain(self.tabs.iter()));
+            if self.ed.needs_save() || self.tabs.iter().any(|t| t.needs_save()) {
+                ctx.request_repaint_after(crate::recovery::EVERY);
+            }
         }
         if let Some(d) = &mut self.export
             && !crate::pageops::export_window(&ctx, &mut self.ed, d)

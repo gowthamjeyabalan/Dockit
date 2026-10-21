@@ -870,6 +870,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "windows",
  "windows-sys 0.60.2",
  "winresource",
 ]
