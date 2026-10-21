@@ -445,6 +445,8 @@ pub struct Editor {
     pub request: Option<Request>,
     /// Copied page objects.
     pub clip: Option<crate::arrange::Clip>,
+    /// Editing (true) or just reading the document.
+    pub editing: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -479,6 +481,7 @@ impl Default for Editor {
             view: View::default(),
             request: None,
             clip: None,
+            editing: false,
         }
     }
 }
@@ -541,7 +544,24 @@ impl Editor {
         }
     }
 
+    /// Switch between reading and editing. Leaving editing finishes anything being typed.
+    pub fn set_editing(&mut self, on: bool) {
+        if !on {
+            self.commit_edits();
+            self.clear_selection();
+            self.tool = Tool::Select;
+            self.image = None;
+        }
+        if self.editing != on {
+            // The two layouts have different widths: refit the page.
+            self.fit = Some(true);
+        }
+        self.editing = on;
+    }
+
     fn after_open(&mut self) {
+        // Documents open for reading; Edit PDF switches to editing.
+        self.editing = false;
         self.clear_transient();
         self.page_sel.clear();
         self.current = 0;

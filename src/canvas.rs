@@ -599,9 +599,13 @@ pub fn canvas_ui(ui: &mut Ui, ed: &mut Editor) {
         let mods = ui.input(|i| i.modifiers);
 
         interact(ui, ed, &resp, &maps, &page_at, pointer, mods, &painter);
-        overlays(ui, ed, &maps, pointer, &painter);
+        if ed.editing {
+            overlays(ui, ed, &maps, pointer, &painter);
+        }
         editors(ui, ed, &maps);
-        context_menu(ed, &resp, &page_at);
+        if ed.editing {
+            context_menu(ed, &resp, &page_at);
+        }
     });
     ed.view.offset = out.state.offset;
 }
@@ -724,6 +728,30 @@ fn interact(
     }
     if matches!(ed.view.drag, Some(Drag::Pan)) {
         ed.view.drag = None;
+    }
+
+    // Reading: dragging scrolls the page and only form fields respond to clicks.
+    if !ed.editing {
+        let on_field = |pos: Pos2| page_at(pos).filter(|(page, m)| ed.file.as_ref().is_some_and(|f| annot_at(&f.annots(*page), m, pos, true).is_some()));
+        if let Some(pos) = pointer
+            && on_field(pos).is_some()
+        {
+            ctx.set_cursor_icon(CursorIcon::PointingHand);
+        }
+        if resp.dragged() {
+            ed.view.pending_offset = Some((ed.view.offset - resp.drag_delta()).max(Vec2::ZERO));
+            ctx.set_cursor_icon(CursorIcon::Grabbing);
+        } else if resp.clicked()
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            if let Some(at) = on_field(pos) {
+                click(ed, Some(at), pos, mods);
+            } else {
+                ed.view.field_menu = None;
+                ed.commit_edits();
+            }
+        }
+        return;
     }
 
     let sel_bounds = selection_bounds(ed, maps);

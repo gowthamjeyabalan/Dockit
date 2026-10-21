@@ -26,6 +26,7 @@ struct Settings {
     appearance: Appearance,
     dock_version: u32,
     dock: Option<DockState<Tab>>,
+    view_dock: Option<DockState<Tab>>,
     recent: Vec<PathBuf>,
     style: Option<Style>,
     signature: Option<Signature>,
@@ -41,6 +42,14 @@ fn default_dock() -> DockState<Tab> {
     let [doc, _pages] = s.split_left(NodeIndex::root(), 0.14, vec![Tab::Pages]);
     let [_doc, right] = s.split_right(doc, 0.78, vec![Tab::Tools]);
     s.split_below(right, 0.46, vec![Tab::Properties, Tab::Comments, Tab::Form]);
+    d
+}
+
+/// Reading layout: page thumbnails beside the document, nothing else.
+fn default_view_dock() -> DockState<Tab> {
+    let mut d = DockState::new(vec![Tab::Document]);
+    let s = d.main_surface_mut();
+    s.split_left(NodeIndex::root(), 0.13, vec![Tab::Pages]);
     d
 }
 
@@ -65,7 +74,10 @@ enum Pending {
 
 pub struct App {
     ed: Editor,
+    /// Layout while editing.
     dock: DockState<Tab>,
+    /// Layout while reading.
+    view_dock: DockState<Tab>,
     appearance: Appearance,
     title: String,
     closing: bool,
@@ -99,9 +111,11 @@ impl App {
             ed.open_path(&arg);
         }
         let dock = settings.dock.filter(|_| settings.dock_version == DOCK_VERSION).unwrap_or_else(default_dock);
+        let view_dock = settings.view_dock.filter(|_| settings.dock_version == DOCK_VERSION).unwrap_or_else(default_view_dock);
         App {
             ed,
             dock,
+            view_dock,
             appearance: settings.appearance,
             title: String::new(),
             closing: false,
@@ -201,8 +215,37 @@ impl App {
         if ev(cmd(Key::Num1)) {
             self.ed.set_zoom(1.0, None);
         }
+        if ev(cmd(Key::E)) {
+            let on = !self.ed.editing;
+            self.ed.set_editing(on);
+        }
         let typing = ctx.egui_wants_keyboard_input() || self.ed.text_edit.is_some() || self.ed.note.is_some() || self.ed.field_edit.is_some();
         if typing {
+            return;
+        }
+        // Reading: undo (for form entries) and paging only.
+        if !self.ed.editing {
+            let ed = &mut self.ed;
+            if ev(cmd_shift(Key::Z)) || ev(cmd(Key::Y)) {
+                ed.redo();
+            } else if ev(cmd(Key::Z)) {
+                ed.undo();
+            }
+            let n = ed.file.as_ref().map_or(0, |f| f.page_count());
+            ctx.input(|i| {
+                if i.key_pressed(Key::PageDown) || i.key_pressed(Key::ArrowRight) {
+                    ed.goto = Some((ed.current + 1).min(n.saturating_sub(1)));
+                }
+                if i.key_pressed(Key::PageUp) || i.key_pressed(Key::ArrowLeft) {
+                    ed.goto = Some(ed.current.saturating_sub(1));
+                }
+                if i.key_pressed(Key::Home) {
+                    ed.goto = Some(0);
+                }
+                if i.key_pressed(Key::End) {
+                    ed.goto = Some(n.saturating_sub(1));
+                }
+            });
             return;
         }
         // Copy, cut and paste of page objects. egui reports Ctrl+V only when the system clipboard
@@ -357,67 +400,71 @@ impl App {
                     self.request(ui.ctx(), Pending::Quit);
                 }
             });
+            let editing = self.ed.editing;
             ui.add_enabled_ui(has, |ui| {
-                ui.menu_button("Edit", |ui| {
-                    if ui.add_enabled(self.ed.can_undo(), egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
-                        self.ed.undo();
-                    }
-                    if ui.add_enabled(self.ed.can_redo(), egui::Button::new("Redo").shortcut_text("Ctrl+Y")).clicked() {
-                        self.ed.redo();
-                    }
-                    ui.separator();
-                    if ui.add(egui::Button::new("Select all on page").shortcut_text("Ctrl+A")).clicked() {
-                        self.ed.select_all();
-                    }
-                    match self.ed.sel.clone() {
-                        crate::editor::Sel::Objects { page, items } => crate::canvas::object_menu(ui, &mut self.ed, page, &items),
-                        crate::editor::Sel::Annot { .. } => {
-                            if ui.button("Delete").clicked() {
-                                self.ed.delete_selection();
-                            }
+                // Reading shows only File and View; editing adds Edit and Pages.
+                if editing {
+                    ui.menu_button("Edit", |ui| {
+                        if ui.add_enabled(self.ed.can_undo(), egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
+                            self.ed.undo();
                         }
-                        crate::editor::Sel::None => {}
-                    }
-                    if self.ed.can_paste() && ui.add(egui::Button::new("Paste").shortcut_text("Ctrl+V")).clicked() {
-                        let page = self.ed.current;
-                        self.ed.paste(page);
-                    }
-                    ui.separator();
-                    if ui.button("Change signature…").clicked() {
-                        self.ed.signature_dialog = true;
-                    }
-                });
-                ui.menu_button("Pages", |ui| {
-                    let k = self.ed.selected_pages().len();
-                    ui.label(theme::secondary(ui, if k > 1 { format!("{k} selected pages") } else { format!("Page {}", self.ed.current + 1) }));
-                    if ui.button("Rotate left").clicked() {
-                        self.ed.rotate_pages(-1);
-                    }
-                    if ui.button("Rotate right").clicked() {
-                        self.ed.rotate_pages(1);
-                    }
-                    if ui.button("Duplicate").clicked() {
-                        self.ed.duplicate_pages();
-                    }
-                    if ui.button("Delete").clicked() {
-                        self.ed.delete_pages();
-                    }
-                    ui.separator();
-                    let after = self.ed.selected_pages().last().copied().unwrap_or(self.ed.current);
-                    if ui.button("Insert blank page").clicked() {
-                        self.ed.insert_blank(after);
-                    }
-                    if ui.button("Insert pages from a file…").clicked() {
-                        self.ed.insert_from_files(after);
-                    }
-                    ui.separator();
-                    if ui.button("Extract…").clicked() {
-                        self.ed.extract_pages();
-                    }
-                    if ui.button("Split into files…").clicked() {
-                        self.split = Some(Split::new(&self.ed));
-                    }
-                });
+                        if ui.add_enabled(self.ed.can_redo(), egui::Button::new("Redo").shortcut_text("Ctrl+Y")).clicked() {
+                            self.ed.redo();
+                        }
+                        ui.separator();
+                        if ui.add(egui::Button::new("Select all on page").shortcut_text("Ctrl+A")).clicked() {
+                            self.ed.select_all();
+                        }
+                        match self.ed.sel.clone() {
+                            crate::editor::Sel::Objects { page, items } => crate::canvas::object_menu(ui, &mut self.ed, page, &items),
+                            crate::editor::Sel::Annot { .. } => {
+                                if ui.button("Delete").clicked() {
+                                    self.ed.delete_selection();
+                                }
+                            }
+                            crate::editor::Sel::None => {}
+                        }
+                        if self.ed.can_paste() && ui.add(egui::Button::new("Paste").shortcut_text("Ctrl+V")).clicked() {
+                            let page = self.ed.current;
+                            self.ed.paste(page);
+                        }
+                        ui.separator();
+                        if ui.button("Change signature…").clicked() {
+                            self.ed.signature_dialog = true;
+                        }
+                    });
+                    ui.menu_button("Pages", |ui| {
+                        let k = self.ed.selected_pages().len();
+                        ui.label(theme::secondary(ui, if k > 1 { format!("{k} selected pages") } else { format!("Page {}", self.ed.current + 1) }));
+                        if ui.button("Rotate left").clicked() {
+                            self.ed.rotate_pages(-1);
+                        }
+                        if ui.button("Rotate right").clicked() {
+                            self.ed.rotate_pages(1);
+                        }
+                        if ui.button("Duplicate").clicked() {
+                            self.ed.duplicate_pages();
+                        }
+                        if ui.button("Delete").clicked() {
+                            self.ed.delete_pages();
+                        }
+                        ui.separator();
+                        let after = self.ed.selected_pages().last().copied().unwrap_or(self.ed.current);
+                        if ui.button("Insert blank page").clicked() {
+                            self.ed.insert_blank(after);
+                        }
+                        if ui.button("Insert pages from a file…").clicked() {
+                            self.ed.insert_from_files(after);
+                        }
+                        ui.separator();
+                        if ui.button("Extract…").clicked() {
+                            self.ed.extract_pages();
+                        }
+                        if ui.button("Split into files…").clicked() {
+                            self.split = Some(Split::new(&self.ed));
+                        }
+                    });
+                }
                 ui.menu_button("View", |ui| {
                     if ui.add(egui::Button::new("Zoom in").shortcut_text("Ctrl++")).clicked() {
                         self.ed.set_zoom(self.ed.zoom * 1.25, None);
@@ -437,7 +484,11 @@ impl App {
                     }
                     ui.separator();
                     if ui.button("Reset panel layout").clicked() {
-                        self.dock = default_dock();
+                        if self.ed.editing {
+                            self.dock = default_dock();
+                        } else {
+                            self.view_dock = default_view_dock();
+                        }
                     }
                 });
             });
@@ -452,6 +503,19 @@ impl App {
                         theme::set_appearance(ui.ctx(), a);
                     }
                 });
+                if self.ed.file.is_some() {
+                    ui.add_space(10.0);
+                    if self.ed.editing {
+                        if ui.add(egui::Button::new("Done").min_size(vec2(72.0, 0.0))).on_hover_text("Back to reading (Ctrl+E)").clicked() {
+                            self.ed.set_editing(false);
+                        }
+                    } else {
+                        let edit = egui::Button::new(theme::semibold("Edit PDF").color(egui::Color32::WHITE)).fill(p.accent).min_size(vec2(84.0, 0.0));
+                        if ui.add(edit).on_hover_text("Edit text, images, pages and more (Ctrl+E)").clicked() {
+                            self.ed.set_editing(true);
+                        }
+                    }
+                }
                 if let Some(f) = &self.ed.file {
                     ui.add_space(8.0);
                     let zoom = format!("{:.0}%", self.ed.zoom * 100.0);
@@ -519,6 +583,7 @@ impl App {
             appearance: self.appearance,
             dock_version: DOCK_VERSION,
             dock: Some(self.dock.clone()),
+            view_dock: Some(self.view_dock.clone()),
             recent: self.ed.recent.clone(),
             style: Some(self.ed.style.clone()),
             signature: self.ed.signature.clone(),
@@ -614,7 +679,8 @@ impl eframe::App for App {
         egui::Panel::top("top-bar").frame(egui::Frame::new().fill(p.bg).inner_margin(Margin::symmetric(6, 4))).show(ui, |ui| self.top_bar(ui));
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg)).show(ui, |ui| {
             let style = theme::dock_style(ui.ctx());
-            DockArea::new(&mut self.dock)
+            let dock = if self.ed.editing { &mut self.dock } else { &mut self.view_dock };
+            DockArea::new(dock)
                 .style(style)
                 .show_close_buttons(false)
                 .show_leaf_close_all_buttons(false)

@@ -200,37 +200,41 @@ pub fn pages_ui(ui: &mut Ui, ed: &mut Editor) {
     let Some(f) = &ed.file else { return no_document(ui) };
     let n = f.page_count();
     let p = pal(ui.ctx());
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = vec2(5.0, 5.0);
-        if ui.button("↺").on_hover_text("Rotate left").clicked() {
-            ed.rotate_pages(-1);
-        }
-        if ui.button("↻").on_hover_text("Rotate right").clicked() {
-            ed.rotate_pages(1);
-        }
-        ui.menu_button("Insert", |ui| {
-            if ui.button("Blank page").clicked() {
-                let after = ed.selected_pages().last().copied().unwrap_or(ed.current);
-                ed.insert_blank(after);
-                ui.close();
+    // Page tools only while editing; reading shows just the thumbnails.
+    let editing = ed.editing;
+    if editing {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(5.0, 5.0);
+            if ui.button("↺").on_hover_text("Rotate left").clicked() {
+                ed.rotate_pages(-1);
             }
-            if ui.button("Pages from a file…").clicked() {
-                let after = ed.selected_pages().last().copied().unwrap_or(ed.current);
-                ed.insert_from_files(after);
-                ui.close();
+            if ui.button("↻").on_hover_text("Rotate right").clicked() {
+                ed.rotate_pages(1);
             }
-            if ui.button("Duplicate selected").clicked() {
-                ed.duplicate_pages();
-                ui.close();
+            ui.menu_button("Insert", |ui| {
+                if ui.button("Blank page").clicked() {
+                    let after = ed.selected_pages().last().copied().unwrap_or(ed.current);
+                    ed.insert_blank(after);
+                    ui.close();
+                }
+                if ui.button("Pages from a file…").clicked() {
+                    let after = ed.selected_pages().last().copied().unwrap_or(ed.current);
+                    ed.insert_from_files(after);
+                    ui.close();
+                }
+                if ui.button("Duplicate selected").clicked() {
+                    ed.duplicate_pages();
+                    ui.close();
+                }
+            });
+            if ui.button("Extract…").on_hover_text("Save the selected pages as a new PDF").clicked() {
+                ed.extract_pages();
+            }
+            if ui.button(RichText::new("Delete").color(p.danger)).clicked() {
+                ed.delete_pages();
             }
         });
-        if ui.button("Extract…").on_hover_text("Save the selected pages as a new PDF").clicked() {
-            ed.extract_pages();
-        }
-        if ui.button(RichText::new("Delete").color(p.danger)).clicked() {
-            ed.delete_pages();
-        }
-    });
+    }
     let sel = ed.selected_pages();
     let info = if ed.page_sel.len() > 1 { format!("{}, {} selected", plural(n, "page", "pages"), ed.page_sel.len()) } else { plural(n, "page", "pages") };
     ui.label(theme::secondary(ui, info));
@@ -286,7 +290,7 @@ pub fn pages_ui(ui: &mut Ui, ed: &mut Editor) {
             {
                 drop_at = Some(if pos.y < outer.center().y { i } else { i + 1 });
             }
-            if resp.drag_started() {
+            if editing && resp.drag_started() {
                 if !sel.contains(&i) || ed.page_sel.is_empty() {
                     ed.page_sel = vec![i];
                 }
@@ -311,42 +315,44 @@ pub fn pages_ui(ui: &mut Ui, ed: &mut Editor) {
             if resp.double_clicked() {
                 ed.goto = Some(i);
             }
-            resp.context_menu(|ui| {
-                if !ed.page_sel.contains(&i) {
-                    ed.page_sel = vec![i];
-                }
-                let k = ed.selected_pages().len();
-                ui.label(theme::secondary(ui, if k > 1 { format!("{k} pages") } else { format!("Page {}", i + 1) }));
-                if ui.button("Rotate left").clicked() {
-                    ed.rotate_pages(-1);
-                    ui.close();
-                }
-                if ui.button("Rotate right").clicked() {
-                    ed.rotate_pages(1);
-                    ui.close();
-                }
-                if ui.button("Duplicate").clicked() {
-                    ed.duplicate_pages();
-                    ui.close();
-                }
-                if ui.button("Insert blank page after").clicked() {
-                    ed.insert_blank(i);
-                    ui.close();
-                }
-                if ui.button("Insert pages from a file…").clicked() {
-                    ed.insert_from_files(i);
-                    ui.close();
-                }
-                if ui.button("Extract…").clicked() {
-                    ed.extract_pages();
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button(RichText::new("Delete").color(pal(ui.ctx()).danger)).clicked() {
-                    ed.delete_pages();
-                    ui.close();
-                }
-            });
+            if editing {
+                resp.context_menu(|ui| {
+                    if !ed.page_sel.contains(&i) {
+                        ed.page_sel = vec![i];
+                    }
+                    let k = ed.selected_pages().len();
+                    ui.label(theme::secondary(ui, if k > 1 { format!("{k} pages") } else { format!("Page {}", i + 1) }));
+                    if ui.button("Rotate left").clicked() {
+                        ed.rotate_pages(-1);
+                        ui.close();
+                    }
+                    if ui.button("Rotate right").clicked() {
+                        ed.rotate_pages(1);
+                        ui.close();
+                    }
+                    if ui.button("Duplicate").clicked() {
+                        ed.duplicate_pages();
+                        ui.close();
+                    }
+                    if ui.button("Insert blank page after").clicked() {
+                        ed.insert_blank(i);
+                        ui.close();
+                    }
+                    if ui.button("Insert pages from a file…").clicked() {
+                        ed.insert_from_files(i);
+                        ui.close();
+                    }
+                    if ui.button("Extract…").clicked() {
+                        ed.extract_pages();
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button(RichText::new("Delete").color(pal(ui.ctx()).danger)).clicked() {
+                        ed.delete_pages();
+                        ui.close();
+                    }
+                });
+            }
         }
         // Insertion line while dragging.
         if let (Some(_), Some(at)) = (dragging, drop_at) {
