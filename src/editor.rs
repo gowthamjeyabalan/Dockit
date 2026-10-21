@@ -8,6 +8,7 @@ use crate::canvas::View;
 use crate::content::{self, Edit};
 use crate::fonts;
 use crate::incremental;
+use crate::annots::{self, NewField};
 use crate::pdf::{self, Annot, Doc, Geom, Glyph, ImageData, Obj, OpenError, Page, PathStyle, Rgba};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -30,6 +31,11 @@ pub enum Tool {
     Note,
     Ink,
     Stamp,
+    Arrow,
+    TextBox,
+    Callout,
+    Measure,
+    Field,
     Sign,
 }
 
@@ -46,6 +52,11 @@ impl Tool {
             Tool::Note => "Note",
             Tool::Ink => "Draw",
             Tool::Stamp => "Stamp",
+            Tool::Arrow => "Arrow",
+            Tool::TextBox => "Text box",
+            Tool::Callout => "Callout",
+            Tool::Measure => "Measure",
+            Tool::Field => "Form field",
             Tool::Sign => "Sign",
         }
     }
@@ -63,6 +74,11 @@ impl Tool {
             Tool::Note => Key::N,
             Tool::Ink => Key::P,
             Tool::Stamp => Key::K,
+            Tool::Arrow => Key::A,
+            Tool::TextBox => Key::X,
+            Tool::Callout => Key::C,
+            Tool::Measure => Key::M,
+            Tool::Field => Key::F,
             Tool::Sign => Key::G,
         }
     }
@@ -78,6 +94,11 @@ impl Tool {
             Tool::Note => "Click to add a comment.",
             Tool::Ink => "Drag to draw freehand.",
             Tool::Stamp => "Click to place the stamp.",
+            Tool::Arrow => "Drag from the tail to the point. Hold Shift for steps of 45°.",
+            Tool::TextBox => "Drag to draw the box, then type. The box grows to fit the text.",
+            Tool::Callout => "Drag from the spot to point at to where the text should go, then type.",
+            Tool::Measure => "Drag between two points to measure the distance. Hold Shift for steps of 45°.",
+            Tool::Field => "Drag to draw a new field, or click an existing one to select, move or rename it.",
             Tool::Sign => "Click to place your signature.",
         }
     }
@@ -126,6 +147,50 @@ pub struct Style {
     pub note: Rgba,
     pub stamp: String,
     pub stamp_color: Rgba,
+    /// Arrows, text boxes, callouts and measurements.
+    pub review_color: Rgba,
+    pub review_width: f32,
+    pub box_size: f32,
+    pub unit: Unit,
+    /// Real distance per page distance (1 for 1:1, 100 for a 1:100 drawing).
+    pub scale: f32,
+    pub field: NewField,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum Unit {
+    Mm,
+    Cm,
+    In,
+    Pt,
+}
+
+impl Unit {
+    pub fn label(self) -> &'static str {
+        match self {
+            Unit::Mm => "mm",
+            Unit::Cm => "cm",
+            Unit::In => "in",
+            Unit::Pt => "pt",
+        }
+    }
+
+    /// This unit per PDF point.
+    pub fn per_point(self) -> f32 {
+        match self {
+            Unit::Mm => 25.4 / 72.0,
+            Unit::Cm => 2.54 / 72.0,
+            Unit::In => 1.0 / 72.0,
+            Unit::Pt => 1.0,
+        }
+    }
+}
+
+/// "12.5 mm" for a distance in points, at the given drawing scale.
+pub fn measure_label(points: f32, unit: Unit, scale: f32) -> String {
+    let v = points * unit.per_point() * scale;
+    let digits = if v >= 100.0 { 0 } else if v >= 10.0 { 1 } else { 2 };
+    format!("{v:.digits$} {}", unit.label())
 }
 
 impl Default for Style {
@@ -146,6 +211,12 @@ impl Default for Style {
             note: [255, 204, 0, 255],
             stamp: "Approved".into(),
             stamp_color: [89, 161, 79, 255],
+            review_color: [225, 87, 89, 255],
+            review_width: 1.5,
+            box_size: 12.0,
+            unit: Unit::Mm,
+            scale: 1.0,
+            field: NewField::Text,
         }
     }
 }
@@ -211,6 +282,14 @@ pub struct NoteDraft {
     pub index: Option<usize>,
     pub text: String,
     pub focus: bool,
+    pub kind: DraftKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum DraftKind {
+    Note,
+    /// A text box (l, b, r, t), pointing at a spot when it is a callout.
+    TextBox { rect: [f32; 4], callout: Option<(f32, f32)> },
 }
 
 pub struct FieldEdit {
@@ -779,7 +858,16 @@ impl Editor {
                 }
             }
             Sel::Annot { page, index } => {
-                self.apply(page, |p| p.remove_annot(index));
+                // Replies and review states go with the comment they belong to.
+                let mut gone: Vec<usize> =
+                    self.file.as_ref().map(|f| f.annots(page).iter().filter(|a| a.reply_to == Some(index)).map(|a| a.index).collect()).unwrap_or_default();
+                gone.push(index);
+                gone.sort_unstable_by(|a, b| b.cmp(a));
+                self.apply(page, |p| {
+                    for i in gone {
+                        p.remove_annot(i);
+                    }
+                });
                 self.say("Deleted the annotation");
             }
             Sel::None => {}
@@ -796,7 +884,15 @@ impl Editor {
                 }
             }
             Sel::Annot { page, index } => {
-                self.apply(page, |p| p.move_annot(index, dx, dy));
+                if self.drawn_here(page, index) {
+                    self.file_update(&[page], |u| {
+                        let id = u.annot_id(page, index)?;
+                        u.modify(id, |d| annots::translate(d, dx, dy))
+                    });
+                    self.sel = Sel::Annot { page, index };
+                } else {
+                    self.apply(page, |p| p.move_annot(index, dx, dy));
+                }
             }
             Sel::None => {}
         }
@@ -1157,13 +1253,14 @@ impl Editor {
 
     pub fn begin_note(&mut self, page: usize, at: (f32, f32)) {
         self.commit_edits();
-        self.note = Some(NoteDraft { page, at, index: None, text: String::new(), focus: true });
+        self.note = Some(NoteDraft { page, at, index: None, text: String::new(), focus: true, kind: DraftKind::Note });
     }
 
     pub fn edit_note(&mut self, page: usize, index: usize) {
         self.commit_edits();
         let Some(a) = self.file.as_ref().and_then(|f| f.annots(page).get(index).cloned()) else { return };
-        self.note = Some(NoteDraft { page, at: (a.rect[0], a.rect[3]), index: Some(index), text: a.contents, focus: true });
+        let kind = if a.subtype == pdf::ANNOT_FREETEXT { DraftKind::TextBox { rect: a.rect, callout: None } } else { DraftKind::Note };
+        self.note = Some(NoteDraft { page, at: (a.rect[0], a.rect[3]), index: Some(index), text: a.contents, focus: true, kind });
     }
 
     pub fn commit_note(&mut self) {
@@ -1172,7 +1269,22 @@ impl Editor {
             Some(i) => {
                 let old = self.file.as_ref().and_then(|f| f.annots(n.page).get(i).map(|a| a.contents.clone()));
                 if old.as_deref() != Some(n.text.as_str()) {
-                    self.apply(n.page, |p| p.set_annot_contents(i, &n.text));
+                    self.set_annot_contents(n.page, i, &n.text);
+                }
+            }
+            None if matches!(n.kind, DraftKind::TextBox { .. }) => {
+                let DraftKind::TextBox { rect, callout } = n.kind else { return };
+                if n.text.trim().is_empty() {
+                    return;
+                }
+                let s = &self.style;
+                let mut d = annots::text_box(rect, &n.text, s.box_size, s.text_color, s.review_color, callout);
+                let ap = annots::build(&mut d);
+                if let Some(i) = self.file_update(&[n.page], |u| u.push_annot(n.page, d, ap).map(|(_, i)| i)) {
+                    self.sel = Sel::Annot { page: n.page, index: i };
+                    if !annots::latin(&n.text) {
+                        self.say("Some characters cannot be shown in a text box and appear as \"?\".");
+                    }
                 }
             }
             None => {
@@ -1188,11 +1300,200 @@ impl Editor {
     }
 
     pub fn set_annot_contents(&mut self, page: usize, index: usize, text: &str) {
+        if self.drawn_here(page, index) {
+            self.file_update(&[page], |u| {
+                let id = u.annot_id(page, index)?;
+                u.modify(id, |d| d.set("Contents", annots::text_string(text)))
+            });
+            return;
+        }
         self.apply(page, |p| p.set_annot_contents(index, text));
     }
 
     pub fn set_annot_color(&mut self, page: usize, index: usize, c: Rgba) {
+        if self.drawn_here(page, index) {
+            let col = lopdf::Object::Array([c[0], c[1], c[2]].iter().map(|&v| lopdf::Object::Real(v as f32 / 255.0)).collect());
+            self.file_update(&[page], |u| {
+                let id = u.annot_id(page, index)?;
+                u.modify(id, |d| {
+                    d.set("C", col.clone());
+                    if d.has(b"IC") {
+                        d.set("IC", col);
+                    }
+                })
+            });
+            return;
+        }
         self.apply(page, |p| p.set_annot_color(index, c));
+    }
+
+    /// Arrows, measurements, text boxes and callouts, whose appearance Dockit draws itself.
+    fn drawn_here(&self, page: usize, index: usize) -> bool {
+        self.file.as_ref().is_some_and(|f| f.annots(page).get(index).is_some_and(|a| matches!(a.subtype, pdf::ANNOT_LINE | pdf::ANNOT_FREETEXT)))
+    }
+
+    /// Change the file directly (see annots.rs), as an incremental update, then show the result.
+    /// `pages` are the pages whose annotations change.
+    pub fn file_update<R>(&mut self, pages: &[usize], change: impl FnOnce(&mut annots::Update) -> Result<R, String>) -> Option<R> {
+        let f = self.file.as_ref()?;
+        let was_encrypted = f.doc.encrypted();
+        let result = f.doc.save_plain().and_then(annots::Update::load).and_then(|mut u| {
+            let r = change(&mut u)?;
+            Ok((u.finish()?, r))
+        });
+        let (bytes, r) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.error = Some(format!("This change could not be made. {e}"));
+                return None;
+            }
+        };
+        let Ok(doc) = Doc::open(bytes, None) else {
+            self.error = Some("This change could not be made: the updated file could not be read back.".into());
+            return None;
+        };
+        let f = self.file.as_mut().unwrap();
+        f.doc = doc;
+        for &p in pages {
+            f.invalidate(p);
+        }
+        if was_encrypted {
+            f.password = None;
+            self.say("This file was password protected. It is saved without protection from now on.");
+        }
+        self.needs_commit = true;
+        Some(r)
+    }
+
+    pub fn add_arrow(&mut self, page: usize, a: (f32, f32), b: (f32, f32)) {
+        let s = &self.style;
+        let mut d = annots::arrow(a, b, s.review_color, s.review_width);
+        let ap = annots::build(&mut d);
+        if let Some(i) = self.file_update(&[page], |u| u.push_annot(page, d, ap).map(|(_, i)| i)) {
+            self.sel = Sel::Annot { page, index: i };
+        }
+    }
+
+    pub fn add_measure(&mut self, page: usize, a: (f32, f32), b: (f32, f32)) {
+        let s = &self.style;
+        let len = (b.0 - a.0).hypot(b.1 - a.1);
+        let label = measure_label(len, s.unit, s.scale);
+        let ratio = if (s.scale - 1.0).abs() < 1e-6 { "1:1".to_string() } else { format!("1:{}", s.scale) };
+        let mut d = annots::dimension(a, b, s.review_color, s.review_width, &label, s.unit.label(), s.unit.per_point() * s.scale, &ratio);
+        let ap = annots::build(&mut d);
+        if let Some(i) = self.file_update(&[page], |u| u.push_annot(page, d, ap).map(|(_, i)| i)) {
+            self.sel = Sel::Annot { page, index: i };
+            self.say(format!("Measured {label}"));
+        }
+    }
+
+    /// Start typing a new text box (or callout pointing at `callout`).
+    pub fn begin_text_box(&mut self, page: usize, rect: [f32; 4], callout: Option<(f32, f32)>) {
+        self.commit_edits();
+        self.note = Some(NoteDraft { page, at: (rect[0], rect[3]), index: None, text: String::new(), focus: true, kind: DraftKind::TextBox { rect, callout } });
+    }
+
+    /// Reply to the annotation `parent` on `page`.
+    pub fn add_reply(&mut self, page: usize, parent: usize, text: &str) {
+        let Some(rect) = self.file.as_ref().and_then(|f| f.annots(page).get(parent).map(|a| a.rect)) else { return };
+        if self
+            .file_update(&[page], |u| {
+                let pid = u.annot_id(page, parent)?;
+                let (d, ap) = annots::reply(pid, rect, text, None);
+                u.push_annot(page, d, Some(ap))
+            })
+            .is_some()
+        {
+            self.say("Reply added");
+        }
+    }
+
+    /// Mark a comment resolved (or open again).
+    pub fn set_resolved(&mut self, page: usize, parent: usize, done: bool) {
+        let Some(rect) = self.file.as_ref().and_then(|f| f.annots(page).get(parent).map(|a| a.rect)) else { return };
+        let state = if done { "Completed" } else { "None" };
+        if self
+            .file_update(&[page], |u| {
+                let pid = u.annot_id(page, parent)?;
+                let (d, ap) = annots::reply(pid, rect, "", Some(state));
+                u.push_annot(page, d, Some(ap))
+            })
+            .is_some()
+        {
+            self.say(if done { "Marked as resolved" } else { "Opened again" });
+        }
+    }
+
+    /// A new form field of the chosen kind in `rect` (l, b, r, t).
+    pub fn add_field(&mut self, page: usize, rect: [f32; 4]) {
+        let kind = self.style.field;
+        let r = self.file_update(&[page], |u| {
+            let names = u.field_names();
+            let base = match kind {
+                NewField::Text => "Text",
+                NewField::Checkbox => "Checkbox",
+                NewField::Dropdown => "Choice",
+                NewField::Signature => "Signature",
+            };
+            let field_name = (1..).map(|k| format!("{base} {k}")).find(|nm| !names.contains(nm)).unwrap();
+            u.add_field(page, kind, rect, &field_name).map(|i| (i, field_name))
+        });
+        if let Some((i, field_name)) = r {
+            self.sel = Sel::Annot { page, index: i };
+            self.say(format!("Added {field_name}. Rename it or change its choices in Properties."));
+        }
+    }
+
+    pub fn rename_field(&mut self, page: usize, index: usize, new: &str) {
+        let new = new.trim();
+        if new.is_empty() {
+            return;
+        }
+        self.file_update(&[page], |u| {
+            if u.field_names().iter().any(|n| n == new) {
+                return Err(format!("A field called \"{new}\" already exists."));
+            }
+            let id = u.annot_id(page, index)?;
+            u.modify(id, |d| d.set("T", annots::text_string(new)))
+        });
+    }
+
+    pub fn set_field_choices(&mut self, page: usize, index: usize, choices: &[String]) {
+        let opt = lopdf::Object::Array(choices.iter().filter(|c| !c.trim().is_empty()).map(|c| annots::text_string(c.trim())).collect());
+        self.file_update(&[page], |u| {
+            let id = u.annot_id(page, index)?;
+            u.modify(id, |d| {
+                d.set("Opt", opt);
+                d.set("V", annots::text_string(""));
+            })
+        });
+    }
+
+    /// Draw every comment, mark and form field into the pages, so they can no longer be changed.
+    /// Links keep working.
+    pub fn flatten(&mut self) {
+        self.commit_edits();
+        let Some(n) = self.file.as_ref().map(|f| f.page_count()) else { return };
+        let pages: Vec<usize> = (0..n).collect();
+        let Some(drawn) = self.file_update(&pages, |u| {
+            let mut drawn = 0;
+            for p in 0..n {
+                drawn += u.flatten_page(p)?;
+            }
+            if drawn > 0 {
+                u.remove_form()?;
+            }
+            Ok(drawn)
+        }) else {
+            return;
+        };
+        self.clear_transient();
+        self.epoch += 1;
+        if drawn == 0 {
+            self.say("There is nothing to flatten.");
+        } else {
+            self.say(format!("Flattened {}", plural(drawn, "comment, mark or field", "comments, marks and fields")));
+        }
     }
 
     // ── form fields ──

@@ -611,6 +611,10 @@ impl App {
                         if ui.button("Page numbers, headers and watermark…").clicked() {
                             self.stamp = Some(crate::pageops::StampDialog::new());
                         }
+                        ui.separator();
+                        if ui.button("Flatten comments and form fields").on_hover_text("Draw every comment, mark and form field into the pages so they can no longer be changed").clicked() {
+                            self.ed.flatten();
+                        }
                     });
                 }
                 ui.menu_button("View", |ui| {

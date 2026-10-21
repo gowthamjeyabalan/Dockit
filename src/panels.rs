@@ -2,7 +2,8 @@
 
 use crate::canvas::{THUMB_W, color_row};
 use crate::content::Edit;
-use crate::editor::{Editor, FontKind, Markup, Sel, Tool, page_ranges, plural};
+use crate::annots::{self, NewField};
+use crate::editor::{Editor, FontKind, Markup, Sel, Tool, Unit, page_ranges, plural};
 use crate::pdf::{self, Kind};
 use crate::theme::{self, UiExt, pal};
 use egui::{Color32, CornerRadius, Key, Rect, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
@@ -14,10 +15,11 @@ fn no_document(ui: &mut Ui) {
 
 // ── Tools ──
 
-const SECTIONS: [(&str, &[Tool]); 4] = [
+const SECTIONS: [(&str, &[Tool]); 5] = [
     ("EDIT", &[Tool::Select, Tool::Text, Tool::Image]),
     ("SHAPES", &[Tool::Rect, Tool::Ellipse, Tool::Line]),
-    ("REVIEW", &[Tool::Highlight, Tool::Note, Tool::Ink, Tool::Stamp]),
+    ("REVIEW", &[Tool::Highlight, Tool::Note, Tool::Ink, Tool::Stamp, Tool::Arrow, Tool::TextBox, Tool::Callout, Tool::Measure]),
+    ("FORMS", &[Tool::Field]),
     ("SIGN", &[Tool::Sign]),
 ];
 
@@ -169,6 +171,39 @@ fn tool_options(ui: &mut Ui, ed: &mut Editor) {
             });
             ui.add(egui::TextEdit::singleline(&mut s.stamp).hint_text("Custom text"));
             color_row(ui, &mut s.stamp_color);
+        }
+        Tool::Arrow | Tool::TextBox | Tool::Callout | Tool::Measure => {
+            theme::heading(ui, "COLOUR");
+            color_row(ui, &mut s.review_color);
+            ui.horizontal(|ui| {
+                ui.label("Line width");
+                ui.add(egui::DragValue::new(&mut s.review_width).range(0.5..=10.0).speed(0.1).suffix(" pt"));
+            });
+            if matches!(ed.tool, Tool::TextBox | Tool::Callout) {
+                theme::heading(ui, "TEXT");
+                ui.horizontal(|ui| {
+                    ui.label("Size");
+                    ui.add(egui::DragValue::new(&mut s.box_size).range(6.0..=72.0).speed(0.2).suffix(" pt"));
+                });
+                color_row(ui, &mut s.text_color);
+            }
+            if ed.tool == Tool::Measure {
+                theme::heading(ui, "UNITS");
+                ui.segmented(&mut s.unit, &[(Unit::Mm, "mm"), (Unit::Cm, "cm"), (Unit::In, "in"), (Unit::Pt, "pt")]);
+                ui.horizontal(|ui| {
+                    ui.label("Scale  1 :");
+                    ui.add(egui::DragValue::new(&mut s.scale).range(0.001..=100000.0).speed(1.0).max_decimals(3));
+                });
+                ui.label(theme::secondary(ui, "For scale drawings: 1 : 100 means 1 mm on the page is 100 mm in reality."));
+            }
+        }
+        Tool::Field => {
+            theme::heading(ui, "NEW FIELD");
+            egui::ComboBox::from_id_salt("field-kind").selected_text(s.field.label()).show_ui(ui, |ui| {
+                for k in [NewField::Text, NewField::Checkbox, NewField::Dropdown, NewField::Signature] {
+                    ui.selectable_value(&mut s.field, k, k.label());
+                }
+            });
         }
         Tool::Sign => {
             theme::heading(ui, "SIGNATURE");
@@ -462,10 +497,25 @@ fn annot_props(ui: &mut Ui, ed: &mut Editor, page: usize, index: usize) {
         ed.sel = Sel::None;
         return;
     };
-    theme::heading(ui, &a.kind_name().to_uppercase());
+    if let Some(field) = &a.field {
+        return field_props(ui, ed, page, index, field.clone(), rev);
+    }
+    let kind = match (a.subtype, a.intent.as_str()) {
+        (pdf::ANNOT_LINE, "LineDimension") => "MEASUREMENT",
+        (pdf::ANNOT_LINE, _) => "ARROW",
+        (pdf::ANNOT_FREETEXT, "FreeTextCallout") => "CALLOUT",
+        _ => "",
+    };
+    theme::heading(ui, &if kind.is_empty() { a.kind_name().to_uppercase() } else { kind.to_string() });
     ui.label(theme::secondary(ui, format!("Page {}", page + 1)));
     if a.subtype != pdf::ANNOT_INK {
-        theme::heading(ui, "COMMENT");
+        if a.subtype == pdf::ANNOT_FREETEXT {
+            theme::heading(ui, "TEXT");
+        } else if a.intent == "LineDimension" {
+            theme::heading(ui, "LABEL");
+        } else {
+            theme::heading(ui, "COMMENT");
+        }
         let id = egui::Id::new(("annot-text", page, index, rev));
         let mut text = temp_text(ui, id, || a.contents.clone());
         let resp = ui.add(egui::TextEdit::multiline(&mut text).desired_rows(3).desired_width(f32::INFINITY).hint_text("Add a comment"));
@@ -483,6 +533,39 @@ fn annot_props(ui: &mut Ui, ed: &mut Editor, page: usize, index: usize) {
     }
     ui.add_space(10.0);
     if ui.button(RichText::new("Delete").color(p.danger)).clicked() {
+        ed.delete_selection();
+    }
+}
+
+fn field_props(ui: &mut Ui, ed: &mut Editor, page: usize, index: usize, field: pdf::Field, rev: u64) {
+    let p = pal(ui.ctx());
+    theme::heading(ui, &field.kind_name().to_uppercase());
+    ui.label(theme::secondary(ui, format!("Page {}", page + 1)));
+    theme::heading(ui, "NAME");
+    let id = egui::Id::new(("field-name", page, index, rev));
+    let mut name = temp_text(ui, id, || field.name.clone());
+    let resp = ui.add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY));
+    set_temp_text(ui, id, name.clone());
+    if (resp.lost_focus() || resp.has_focus() && ui.input(|i| i.key_pressed(Key::Enter))) && name.trim() != field.name && !name.trim().is_empty() {
+        ed.rename_field(page, index, &name);
+    }
+    if matches!(field.kind, pdf::FIELD_COMBO | pdf::FIELD_LIST) {
+        theme::heading(ui, "CHOICES");
+        let id = egui::Id::new(("field-choices", page, index, rev));
+        let current: Vec<String> = field.options.iter().map(|o| o.0.clone()).collect();
+        let mut text = temp_text(ui, id, || current.join("\n"));
+        let resp = ui.add(egui::TextEdit::multiline(&mut text).desired_rows(4).desired_width(f32::INFINITY).hint_text("One choice per line"));
+        set_temp_text(ui, id, text.clone());
+        let new: Vec<String> = text.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+        if resp.lost_focus() && new != current {
+            ed.set_field_choices(page, index, &new);
+        }
+        ui.label(theme::secondary(ui, "One choice per line."));
+    }
+    ui.add_space(4.0);
+    ui.label(theme::secondary(ui, "With the Form field tool, drag the field to move it. With Select, click it to fill it in."));
+    ui.add_space(10.0);
+    if ui.button(RichText::new("Delete field").color(p.danger)).clicked() {
         ed.delete_selection();
     }
 }
@@ -701,48 +784,156 @@ pub fn comments_ui(ui: &mut Ui, ed: &mut Editor) {
     let Some(f) = &ed.file else { return no_document(ui) };
     let p = pal(ui.ctx());
     let n = f.page_count();
+    // Top-level comments and marks, each with its replies and latest review state.
     let mut rows = Vec::new();
     for page in 0..n {
-        for a in f.annots(page).iter().filter(|a| !matches!(a.subtype, pdf::ANNOT_WIDGET | pdf::ANNOT_POPUP | pdf::ANNOT_LINK)) {
-            rows.push((page, a.clone()));
+        let annots = f.annots(page);
+        for a in annots.iter().filter(|a| !matches!(a.subtype, pdf::ANNOT_WIDGET | pdf::ANNOT_POPUP | pdf::ANNOT_LINK) && a.reply_to.is_none()) {
+            let mut replies: Vec<pdf::Annot> = annots.iter().filter(|r| r.reply_to == Some(a.index) && r.state.is_none()).cloned().collect();
+            replies.sort_by(|x, y| x.modified.cmp(&y.modified));
+            let resolved = annots
+                .iter()
+                .filter(|r| r.reply_to == Some(a.index) && r.state.is_some())
+                .max_by(|x, y| x.modified.cmp(&y.modified).then(x.index.cmp(&y.index)))
+                .is_some_and(|r| matches!(r.state.as_deref(), Some("Completed" | "Accepted")));
+            rows.push((page, a.clone(), replies, resolved));
         }
     }
+    let editing = ed.editing;
+    let open = rows.iter().filter(|r| !r.3).count();
     ui.label(theme::secondary(
         ui,
         if rows.is_empty() {
             "No comments or marks yet. Use the Review tools to add them.".to_string()
         } else {
-            plural(rows.len(), "comment or mark", "comments and marks")
+            format!("{}, {} open", plural(rows.len(), "comment or mark", "comments and marks"), open)
         },
     ));
+    let show_resolved_id = egui::Id::new("comments-show-resolved");
+    let mut show_resolved = ui.data(|d| d.get_temp::<bool>(show_resolved_id)).unwrap_or(true);
+    if rows.iter().any(|r| r.3) && ui.checkbox(&mut show_resolved, "Show resolved").changed() {
+        ui.data_mut(|d| d.insert_temp(show_resolved_id, show_resolved));
+    }
+    let mut actions: Vec<CommentAction> = Vec::new();
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        for (page, a) in rows {
+        for (page, a, replies, resolved) in rows {
+            if resolved && !show_resolved {
+                continue;
+            }
             let selected = ed.sel == Sel::Annot { page, index: a.index };
             let frame = theme::inner_card(ui).stroke(Stroke::new(1.0, if selected { p.accent } else { p.inner_card_stroke }));
             let resp = frame
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
+                    let head = ui.horizontal(|ui| {
                         if let Some(c) = a.color {
                             let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
                             ui.painter().circle_filled(r.center(), 4.5, Color32::from_rgb(c[0], c[1], c[2]));
                         }
-                        ui.label(theme::semibold(a.kind_name()));
+                        let kind = match (a.subtype, a.intent.as_str()) {
+                            (pdf::ANNOT_LINE, "LineDimension") => "Measurement",
+                            (pdf::ANNOT_LINE, _) => "Arrow",
+                            (pdf::ANNOT_FREETEXT, "FreeTextCallout") => "Callout",
+                            _ => a.kind_name(),
+                        };
+                        ui.label(theme::semibold(kind));
                         ui.label(theme::secondary(ui, format!("Page {}", page + 1)));
+                        if resolved {
+                            ui.label(RichText::new("Resolved").color(p.accent_text).size(11.0));
+                        }
                     });
-                    if !a.contents.is_empty() {
-                        ui.label(&a.contents);
+                    // Only the header and text select the comment; the card's buttons and reply box
+                    // must keep their own clicks.
+                    let mut picked = head.response.interact(Sense::click()).clicked();
+                    let byline = [a.author.clone(), annots::show_date(&a.modified)].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" · ");
+                    if !byline.is_empty() {
+                        ui.label(theme::secondary(ui, byline).size(11.0));
                     }
+                    if !a.contents.is_empty() {
+                        picked |= ui.add(egui::Label::new(&a.contents).sense(Sense::click())).clicked();
+                    }
+                    for r in &replies {
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(10.0);
+                            ui.vertical(|ui| {
+                                let who = [r.author.clone(), annots::show_date(&r.modified)].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" · ");
+                                ui.label(theme::secondary(ui, who).size(11.0));
+                                ui.label(&r.contents);
+                            });
+                        });
+                    }
+                    if editing {
+                        let id = egui::Id::new(("reply", page, a.index));
+                        let mut draft: Option<String> = ui.data(|d| d.get_temp(id));
+                        let mut close = false;
+                        let mut start = false;
+                        match &mut draft {
+                            Some(text) => {
+                                let resp = ui.add(egui::TextEdit::multiline(text).desired_rows(2).desired_width(f32::INFINITY).hint_text("Write a reply"));
+                                if resp.gained_focus() || ui.data(|d| d.get_temp::<bool>(id.with("focus"))).unwrap_or(false) {
+                                    resp.request_focus();
+                                    ui.data_mut(|d| d.remove::<bool>(id.with("focus")));
+                                }
+                                let focused = resp.has_focus();
+                                let send = focused && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::Enter));
+                                ui.horizontal(|ui| {
+                                    if (ui.add_enabled(!text.trim().is_empty(), egui::Button::new("Reply")).clicked() || send) && !text.trim().is_empty() {
+                                        actions.push(CommentAction::Reply(page, a.index, text.trim().to_string()));
+                                        close = true;
+                                    } else if ui.button("Cancel").clicked() {
+                                        close = true;
+                                    }
+                                });
+                            }
+                            None => {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("Reply").clicked() {
+                                        start = true;
+                                        ui.data_mut(|d| d.insert_temp(id.with("focus"), true));
+                                    }
+                                    if ui.small_button(if resolved { "Reopen" } else { "Resolve" }).clicked() {
+                                        actions.push(CommentAction::Resolve(page, a.index, !resolved));
+                                    }
+                                });
+                            }
+                        }
+                        if close {
+                            draft = None;
+                        }
+                        if start {
+                            draft = Some(String::new());
+                        }
+                        ui.data_mut(|d| match draft {
+                            Some(t) => {
+                                d.insert_temp(id, t);
+                            }
+                            None => {
+                                d.remove::<String>(id);
+                            }
+                        });
+                    }
+                    picked
                 })
-                .response
-                .interact(Sense::click());
-            if resp.clicked() {
+                .inner;
+            if resp {
                 ed.sel = Sel::Annot { page, index: a.index };
                 ed.goto = Some(page);
             }
             ui.add_space(2.0);
         }
     });
+    for act in actions {
+        match act {
+            CommentAction::Reply(page, index, text) => ed.add_reply(page, index, &text),
+            CommentAction::Resolve(page, index, done) => ed.set_resolved(page, index, done),
+        }
+    }
+}
+
+enum CommentAction {
+    Reply(usize, usize, String),
+    Resolve(usize, usize, bool),
 }
 
 // ── Form ──
@@ -750,7 +941,7 @@ pub fn comments_ui(ui: &mut Ui, ed: &mut Editor) {
 pub fn form_ui(ui: &mut Ui, ed: &mut Editor) {
     let Some(f) = &ed.file else { return no_document(ui) };
     if !f.doc.has_form() {
-        ui.label(theme::secondary(ui, "This document has no form fields."));
+        ui.label(theme::secondary(ui, "This document has no form fields. In Edit PDF, the Form field tool (F) adds them."));
         return;
     }
     let n = f.page_count();

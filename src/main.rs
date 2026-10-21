@@ -2,6 +2,7 @@
 //! fill in forms and sign. PDFium (Chrome's PDF engine) reads, draws and writes the files.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod annots;
 mod app;
 mod arrange;
 mod canvas;
@@ -17,9 +18,9 @@ mod pdf;
 mod theme;
 
 /// Every tool, in the order the Tools panel lists them (used for keyboard shortcuts).
-pub fn panels_tools() -> [editor::Tool; 11] {
+pub fn panels_tools() -> [editor::Tool; 16] {
     use editor::Tool::*;
-    [Select, Text, Image, Rect, Ellipse, Line, Highlight, Note, Ink, Stamp, Sign]
+    [Select, Text, Image, Rect, Ellipse, Line, Highlight, Note, Ink, Stamp, Arrow, TextBox, Callout, Measure, Field, Sign]
 }
 
 fn main() -> eframe::Result<()> {

@@ -15,7 +15,7 @@ pub struct PageData {
 }
 
 /// The effective resource dictionary of a page (its own, or the nearest inherited one).
-fn resources(doc: &lopdf::Document, page_id: ObjectId) -> Dictionary {
+pub fn resources(doc: &lopdf::Document, page_id: ObjectId) -> Dictionary {
     let Ok((direct, ids)) = doc.get_page_resources(page_id) else { return Dictionary::new() };
     if let Some(d) = direct {
         return d.clone();
@@ -23,7 +23,7 @@ fn resources(doc: &lopdf::Document, page_id: ObjectId) -> Dictionary {
     ids.first().and_then(|id| doc.get_dictionary(*id).ok()).cloned().unwrap_or_default()
 }
 
-fn sub_dict(doc: &lopdf::Document, res: &Dictionary, key: &[u8]) -> Dictionary {
+pub fn sub_dict(doc: &lopdf::Document, res: &Dictionary, key: &[u8]) -> Dictionary {
     match res.get(key) {
         Ok(Object::Dictionary(d)) => d.clone(),
         Ok(Object::Reference(id)) => doc.get_dictionary(*id).cloned().unwrap_or_default(),

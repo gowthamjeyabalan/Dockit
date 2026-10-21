@@ -1,7 +1,8 @@
 //! The document view: pages stacked in a scrolling column, drawn from PDFium renders, with the
 //! selection, previews and every tool's mouse handling on top.
 
-use crate::editor::{Editor, Request, Sel, Signature, Tool};
+use crate::annots::NewField;
+use crate::editor::{DraftKind, Editor, Request, Sel, Signature, Tool, measure_label};
 use crate::pdf::{self, Annot, Geom, Glyph, Kind, Obj, Seg};
 use crate::theme::{self, pal};
 use egui::{Color32, CursorIcon, Key, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
@@ -41,7 +42,36 @@ enum Drag {
     Image { page: usize, from: Pos2 },
     AnnotMove { page: usize, from: Pos2, rect: Rect },
     Rotate { page: usize, bbox: Rect, from: Pos2 },
+    /// A text box or form field being drawn.
+    Box { page: usize, from: Pos2 },
+    /// A callout: from the spot it points at to where its text goes.
+    Callout { page: usize, from: Pos2 },
     Pan,
+}
+
+/// Default size (points) of a new form field of each kind.
+fn field_size(kind: NewField) -> (f32, f32) {
+    match kind {
+        NewField::Text | NewField::Dropdown => (160.0, 22.0),
+        NewField::Checkbox => (14.0, 14.0),
+        NewField::Signature => (180.0, 50.0),
+    }
+}
+
+/// The text box of a callout whose text goes at `at` (screen), on the side away from `anchor`.
+fn callout_box(anchor: Pos2, at: Pos2, zoom: f32, text_size: f32) -> Rect {
+    let (w, h) = (170.0 * zoom, (text_size * 1.2 + 10.0) * zoom);
+    let x = if at.x >= anchor.x { at.x } else { at.x - w };
+    Rect::from_min_size(pos2(x, at.y - h / 2.0), vec2(w, h))
+}
+
+/// An open arrowhead at `tip`, coming from `from`, as screen line segments.
+fn arrow_head(from: Pos2, tip: Pos2, width: f32) -> [[Pos2; 2]; 2] {
+    let d = (tip - from).normalized();
+    let size = (width * 3.0 + 5.0).min((tip - from).length() * 0.6);
+    let back = tip - d * size;
+    let side = vec2(-d.y, d.x) * size * 0.5;
+    [[back + side, tip], [back - side, tip]]
 }
 
 /// The rotate handle sits above the middle of the selection's top edge.
@@ -368,11 +398,12 @@ fn glyph_near(glyphs: &[Glyph], p: (f32, f32)) -> Option<usize> {
 }
 
 fn annot_pickable(a: &Annot) -> bool {
-    !matches!(a.subtype, pdf::ANNOT_WIDGET | pdf::ANNOT_POPUP | pdf::ANNOT_LINK)
+    // Replies and review states belong to another comment and are not on the page themselves.
+    !matches!(a.subtype, pdf::ANNOT_WIDGET | pdf::ANNOT_POPUP | pdf::ANNOT_LINK) && a.reply_to.is_none()
 }
 
 fn annot_movable(a: &Annot) -> bool {
-    matches!(a.subtype, pdf::ANNOT_TEXT | pdf::ANNOT_FREETEXT | pdf::ANNOT_SQUARE | pdf::ANNOT_CIRCLE | pdf::ANNOT_STAMP | pdf::ANNOT_INK)
+    matches!(a.subtype, pdf::ANNOT_TEXT | pdf::ANNOT_FREETEXT | pdf::ANNOT_LINE | pdf::ANNOT_SQUARE | pdf::ANNOT_CIRCLE | pdf::ANNOT_STAMP | pdf::ANNOT_INK)
 }
 
 /// Positions of each page in content coordinates, and the content size.
@@ -802,6 +833,7 @@ fn interact(
                 }
             }
             Tool::Highlight => ctx.set_cursor_icon(CursorIcon::Text),
+            Tool::Field if annot_at(&f.annots(page), &m, pos, true).is_some() => ctx.set_cursor_icon(CursorIcon::Move),
             _ => ctx.set_cursor_icon(CursorIcon::Crosshair),
         }
     }
@@ -819,7 +851,7 @@ fn interact(
         let pos = resp.interact_pointer_pos().unwrap();
         let f = ed.file.as_ref().unwrap();
         if let Some(ai) = annot_at(&f.annots(page), &m, pos, false) {
-            if f.annots(page).iter().any(|a| a.index == ai && a.subtype == pdf::ANNOT_TEXT) {
+            if f.annots(page).iter().any(|a| a.index == ai && matches!(a.subtype, pdf::ANNOT_TEXT | pdf::ANNOT_FREETEXT)) {
                 ed.edit_note(page, ai);
             }
         } else if let Some(oi) = object_at(&f.objects(page), &m, pos) {
@@ -943,6 +975,21 @@ fn click(ed: &mut Editor, at: Option<(usize, Map)>, pos: Pos2, mods: egui::Modif
             }
         }
         Tool::Note => ed.begin_note(page, u),
+        Tool::TextBox => {
+            let w = 170.0 / m.g.unit().max(1e-3);
+            ed.begin_text_box(page, [u.0, u.1 - 20.0, u.0 + w, u.1], None);
+        }
+        Tool::Callout | Tool::Arrow | Tool::Measure => ed.say(ed.tool.hint()),
+        Tool::Field => {
+            ed.commit_edits();
+            let annots = ed.file.as_ref().unwrap().annots(page);
+            if let Some(fi) = annot_at(&annots, &m, pos, true) {
+                ed.sel = Sel::Annot { page, index: fi };
+            } else {
+                let (w, h) = field_size(ed.style.field);
+                ed.add_field(page, [u.0, u.1 - h, u.0 + w, u.1]);
+            }
+        }
         Tool::Stamp => ed.add_stamp(page, u),
         Tool::Sign => ed.place_signature(page, u),
         Tool::Image => {
@@ -992,7 +1039,19 @@ fn start_drag(ed: &mut Editor, at: Option<(usize, Map)>, start: Pos2, sel_bounds
             }
             Some(Drag::Band { page, from: start })
         }
-        Tool::Rect | Tool::Ellipse | Tool::Line => Some(Drag::Shape { page, from: start }),
+        Tool::Rect | Tool::Ellipse | Tool::Line | Tool::Arrow | Tool::Measure => Some(Drag::Shape { page, from: start }),
+        Tool::TextBox => Some(Drag::Box { page, from: start }),
+        Tool::Callout => Some(Drag::Callout { page, from: start }),
+        Tool::Field => {
+            ed.commit_edits();
+            let annots = ed.file.as_ref().unwrap().annots(page);
+            if let Some(fi) = annot_at(&annots, &m, start, true) {
+                let a = annots.iter().find(|a| a.index == fi)?.clone();
+                ed.sel = Sel::Annot { page, index: fi };
+                return Some(Drag::AnnotMove { page, from: start, rect: m.rect(a.rect) });
+            }
+            Some(Drag::Box { page, from: start })
+        }
         Tool::Highlight => Some(Drag::Markup { page, from: m.user(start) }),
         Tool::Ink => Some(Drag::Ink { page, pts: vec![m.user(start)] }),
         Tool::Image => {
@@ -1010,7 +1069,7 @@ fn shape_end(from: Pos2, to: Pos2, tool: Tool, shift: bool) -> Pos2 {
     }
     let d = to - from;
     match tool {
-        Tool::Line => {
+        Tool::Line | Tool::Arrow | Tool::Measure => {
             let a = (d.y.atan2(d.x) / std::f32::consts::FRAC_PI_4).round() * std::f32::consts::FRAC_PI_4;
             from + vec2(a.cos(), a.sin()) * d.length()
         }
@@ -1069,6 +1128,22 @@ fn preview(ui: &Ui, ed: &Editor, maps: &HashMap<usize, Map>, pos: Pos2, mods: eg
         Drag::AnnotMove { rect, from, .. } => {
             painter.rect_stroke(rect.translate(pos - *from), 2.0, accent, StrokeKind::Outside);
         }
+        Drag::Box { from, .. } => {
+            let r = Rect::from_two_pos(*from, pos);
+            painter.rect_filled(r, 0.0, p.accent.gamma_multiply(0.08));
+            painter.rect_stroke(r, 0.0, accent, StrokeKind::Inside);
+        }
+        Drag::Callout { page, from } => {
+            let Some(m) = maps.get(page) else { return };
+            let r = callout_box(*from, pos, m.zoom, ed.style.box_size);
+            let c = Stroke::new(1.5, color32(ed.style.review_color));
+            let end = pos2(if pos.x >= from.x { r.left() } else { r.right() }, r.center().y);
+            painter.line_segment([end, *from], c);
+            for seg in arrow_head(end, *from, 1.0) {
+                painter.line_segment(seg, c);
+            }
+            painter.rect_stroke(r, 0.0, c, StrokeKind::Inside);
+        }
         Drag::Band { from, .. } => {
             let r = Rect::from_two_pos(*from, pos);
             painter.rect_filled(r, 0.0, p.accent.gamma_multiply(0.12));
@@ -1082,6 +1157,25 @@ fn preview(ui: &Ui, ed: &Editor, maps: &HashMap<usize, Map>, pos: Pos2, mods: eg
             match ed.tool {
                 Tool::Line => {
                     painter.line_segment([*from, to], stroke);
+                }
+                Tool::Arrow | Tool::Measure => {
+                    let stroke = Stroke::new((s.review_width * m.zoom).max(1.0), color32(s.review_color));
+                    painter.line_segment([*from, to], stroke);
+                    for seg in arrow_head(*from, to, s.review_width * m.zoom) {
+                        painter.line_segment(seg, stroke);
+                    }
+                    if ed.tool == Tool::Measure {
+                        for seg in arrow_head(to, *from, s.review_width * m.zoom) {
+                            painter.line_segment(seg, stroke);
+                        }
+                        let (a, b) = (m.user(*from), m.user(to));
+                        let label = measure_label((b.0 - a.0).hypot(b.1 - a.1) * m.g.unit().max(1e-3), s.unit, s.scale);
+                        let at = pos2((from.x + to.x) / 2.0, (from.y + to.y) / 2.0) - vec2(0.0, 10.0);
+                        let galley = painter.layout_no_wrap(label, egui::FontId::proportional(12.0), Color32::WHITE);
+                        let r = Rect::from_center_size(at, galley.size() + vec2(10.0, 4.0));
+                        painter.rect_filled(r, 4.0, p.accent);
+                        painter.galley(r.min + vec2(5.0, 2.0), galley, Color32::WHITE);
+                    }
                 }
                 Tool::Rect => {
                     let r = Rect::from_two_pos(*from, to);
@@ -1194,6 +1288,11 @@ fn finish_drag(ed: &mut Editor, d: Drag, maps: &HashMap<usize, Map>, pos: Pos2, 
             if (to - from).length() < 3.0 {
                 return;
             }
+            match ed.tool {
+                Tool::Arrow => return ed.add_arrow(page, m.user(from), m.user(to)),
+                Tool::Measure => return ed.add_measure(page, m.user(from), m.user(to)),
+                _ => {}
+            }
             let s = ed.style.clone();
             let style =
                 pdf::PathStyle { fill: if ed.tool == Tool::Line { None } else { s.fill }, stroke: Some(s.stroke), width: s.width / m.g.unit().max(1e-3) };
@@ -1231,6 +1330,30 @@ fn finish_drag(ed: &mut Editor, d: Drag, maps: &HashMap<usize, Map>, pos: Pos2, 
             if pts.len() > 1 {
                 ed.add_ink(page, pts);
             }
+        }
+        Drag::Box { page, from } => {
+            let Some(m) = maps.get(&page) else { return };
+            let r = Rect::from_two_pos(from, pos);
+            let unit = m.g.unit().max(1e-3);
+            let (dw, dh) = match ed.tool {
+                Tool::Field => field_size(ed.style.field),
+                _ => (170.0, 20.0),
+            };
+            // A tiny drag is a click: use the default size there.
+            let r = if r.width() < 6.0 || r.height() < 6.0 { Rect::from_min_size(from, vec2(dw * unit * m.zoom, dh * unit * m.zoom)) } else { r };
+            let u = m.user_rect(r);
+            match ed.tool {
+                Tool::Field => ed.add_field(page, u),
+                _ => ed.begin_text_box(page, u, None),
+            }
+        }
+        Drag::Callout { page, from } => {
+            let Some(m) = maps.get(&page) else { return };
+            if (pos - from).length() < 8.0 {
+                return ed.say(Tool::Callout.hint());
+            }
+            let r = callout_box(from, pos, m.zoom, ed.style.box_size);
+            ed.begin_text_box(page, m.user_rect(r), Some(m.user(from)));
         }
         Drag::Image { page, from } => {
             let Some(m) = maps.get(&page) else { return };
@@ -1432,16 +1555,36 @@ fn editors(ui: &mut Ui, ed: &mut Editor, maps: &HashMap<usize, Map>) {
         }
     }
 
-    // Note pop-up.
+    // Note and text box pop-up.
+    let review = color32(ed.style.review_color);
     if let Some(n) = &mut ed.note
         && let Some(m) = maps.get(&n.page)
     {
         let at = m.screen(n.at) + vec2(26.0, 0.0);
         let mut done = None;
+        let title = match (n.kind, n.index.is_some()) {
+            (DraftKind::Note, false) => "New comment",
+            (DraftKind::Note, true) => "Edit comment",
+            (DraftKind::TextBox { callout: Some(_), .. }, false) => "New callout",
+            (DraftKind::TextBox { .. }, false) => "New text box",
+            (DraftKind::TextBox { .. }, true) => "Edit text",
+        };
+        // Show where a new text box goes while its text is typed.
+        let at = if let (DraftKind::TextBox { rect, callout }, None) = (n.kind, n.index) {
+            let r = m.rect(rect);
+            let c = Stroke::new(1.5, review);
+            ui.painter().rect_stroke(r, 0.0, c, StrokeKind::Inside);
+            if let Some(pt) = callout {
+                ui.painter().line_segment([m.screen(pt), pos2(if m.screen(pt).x < r.left() { r.left() } else { r.right() }, r.center().y)], c);
+            }
+            r.left_bottom() + vec2(0.0, 6.0)
+        } else {
+            at
+        };
         egui::Area::new(egui::Id::new("note-editor")).order(egui::Order::Foreground).fixed_pos(at).show(ui.ctx(), |ui| {
             egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
                 ui.set_width(240.0);
-                ui.label(theme::semibold(if n.index.is_some() { "Edit comment" } else { "New comment" }));
+                ui.label(theme::semibold(title));
                 // Read Ctrl+Enter before the text box, which would take it as a new line.
                 if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::Enter)) {
                     done = Some(true);
@@ -1451,7 +1594,7 @@ fn editors(ui: &mut Ui, ed: &mut Editor, maps: &HashMap<usize, Map>) {
                         .id(egui::Id::new("note-text"))
                         .desired_rows(3)
                         .desired_width(f32::INFINITY)
-                        .hint_text("Type a comment"),
+                        .hint_text(if n.kind == DraftKind::Note { "Type a comment" } else { "Type the text" }),
                 );
                 if n.focus {
                     resp.request_focus();
@@ -1560,8 +1703,12 @@ fn context_menu(ed: &mut Editor, resp: &egui::Response, page_at: &dyn Fn(Pos2) -
                 ui.separator();
             }
             Sel::Annot { page, index } => {
-                let is_note = ed.file.as_ref().is_some_and(|f| f.annots(page).iter().any(|a| a.index == index && a.subtype == pdf::ANNOT_TEXT));
-                if is_note && ui.button("Edit comment").clicked() {
+                let subtype = ed.file.as_ref().and_then(|f| f.annots(page).iter().find(|a| a.index == index).map(|a| a.subtype));
+                if subtype == Some(pdf::ANNOT_TEXT) && ui.button("Edit comment").clicked() {
+                    ed.edit_note(page, index);
+                    ui.close();
+                }
+                if subtype == Some(pdf::ANNOT_FREETEXT) && ui.button("Edit text").clicked() {
                     ed.edit_note(page, index);
                     ui.close();
                 }

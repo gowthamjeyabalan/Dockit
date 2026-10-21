@@ -38,6 +38,7 @@ fn lib() -> &'static dyn PdfiumLibraryBindings {
 // ── constants from the PDFium headers ──
 
 pub const ANNOT_TEXT: i32 = 1;
+pub const ANNOT_LINE: i32 = 4;
 pub const ANNOT_LINK: i32 = 2;
 pub const ANNOT_FREETEXT: i32 = 3;
 pub const ANNOT_SQUARE: i32 = 5;
@@ -537,6 +538,15 @@ pub struct Annot {
     pub contents: String,
     pub color: Option<Rgba>,
     pub field: Option<Field>,
+    /// The annotation this one replies to (or records a review state for).
+    pub reply_to: Option<usize>,
+    /// A review state ("Completed", "None", ...) when this records one rather than a reply.
+    pub state: Option<String>,
+    pub author: String,
+    /// Last change, as a PDF date string ("D:20261021...").
+    pub modified: String,
+    /// The /IT intent, such as "LineDimension" or "FreeTextCallout".
+    pub intent: String,
 }
 
 impl Annot {
@@ -550,7 +560,7 @@ pub fn annot_name(subtype: i32) -> &'static str {
         ANNOT_TEXT => "Note",
         ANNOT_LINK => "Link",
         ANNOT_FREETEXT => "Text box",
-        4 => "Line",
+        ANNOT_LINE => "Line",
         ANNOT_SQUARE => "Rectangle",
         ANNOT_CIRCLE => "Ellipse",
         7 => "Polygon",
@@ -1018,8 +1028,9 @@ impl<'d> Page<'d> {
                 l.FPDFAnnot_GetRect(a, &mut r);
                 let contents = read_wide(|b, n| l.FPDFAnnot_GetStringValue(a, "Contents", b, n));
                 let (mut cr, mut cg, mut cb, mut ca) = (0, 0, 0, 0);
-                let color =
-                    (l.FPDFAnnot_GetColor(a, COLORTYPE_COLOR, &mut cr, &mut cg, &mut cb, &mut ca) != 0).then_some([cr as u8, cg as u8, cb as u8, ca as u8]);
+                let color = (l.FPDFAnnot_GetColor(a, COLORTYPE_COLOR, &mut cr, &mut cg, &mut cb, &mut ca) != 0)
+                    .then_some([cr as u8, cg as u8, cb as u8, ca as u8])
+                    .or_else(|| appearance_color(a));
                 let field = (subtype == ANNOT_WIDGET && !form.is_null()).then(|| {
                     let kind = l.FPDFAnnot_GetFormFieldType(form, a);
                     let options = if matches!(kind, FIELD_COMBO | FIELD_LIST) {
@@ -1039,7 +1050,28 @@ impl<'d> Page<'d> {
                     }
                 });
                 let (lo, hi) = (r.bottom.min(r.top), r.bottom.max(r.top));
-                Annot { index: i, subtype, rect: [r.left.min(r.right), lo, r.left.max(r.right), hi], contents, color, field }
+                let irt = l.FPDFAnnot_GetLinkedAnnot(a, "IRT");
+                let reply_to = (!irt.is_null()).then(|| {
+                    let k = l.FPDFPage_GetAnnotIndex(self.h, irt);
+                    l.FPDFPage_CloseAnnot(irt);
+                    k
+                });
+                let reply_to = reply_to.filter(|&k| k >= 0).map(|k| k as usize);
+                let get = |key: &str| read_wide(|b, n| l.FPDFAnnot_GetStringValue(a, key, b, n));
+                let state = (l.FPDFAnnot_HasKey(a, "State") != 0).then(|| get("State"));
+                Annot {
+                    index: i,
+                    subtype,
+                    rect: [r.left.min(r.right), lo, r.left.max(r.right), hi],
+                    contents,
+                    color,
+                    field,
+                    reply_to,
+                    state,
+                    author: get("T"),
+                    modified: get("M"),
+                    intent: get("IT"),
+                }
             });
             if let Some(a) = a {
                 out.push(a);
@@ -1230,6 +1262,32 @@ impl<'d> Page<'d> {
         })
         .unwrap_or(false)
     }
+}
+
+/// PDFium will not report the colour of an annotation that has its own appearance, so take it
+/// from the first path drawn in that appearance (its outline, or its fill if it has none).
+unsafe fn appearance_color(a: pdfium_render::prelude::FPDF_ANNOTATION) -> Option<Rgba> {
+    let l = lib();
+    unsafe {
+        for k in 0..l.FPDFAnnot_GetObjectCount(a) {
+            let o = l.FPDFAnnot_GetObject(a, k);
+            if o.is_null() || l.FPDFPageObj_GetType(o) != 2 {
+                continue;
+            }
+            let (mut fill, mut stroke) = (0, 0);
+            l.FPDFPath_GetDrawMode(o, &mut fill, &mut stroke);
+            let (mut r, mut g, mut b, mut al) = (0, 0, 0, 0);
+            let ok = if stroke != 0 {
+                l.FPDFPageObj_GetStrokeColor(o, &mut r, &mut g, &mut b, &mut al)
+            } else {
+                l.FPDFPageObj_GetFillColor(o, &mut r, &mut g, &mut b, &mut al)
+            };
+            if ok != 0 {
+                return Some([r as u8, g as u8, b as u8, 255]);
+            }
+        }
+    }
+    None
 }
 
 /// Approximate width of Helvetica Bold text (average advance), enough to centre a stamp label.
