@@ -74,6 +74,9 @@ pub struct App {
     split: Option<Split>,
     pad: Option<SignaturePad>,
     script_font: ScriptFont,
+    /// Ctrl+V was down last frame (so one press pastes once).
+    v_was_down: bool,
+    last_paste: Option<std::time::Instant>,
     /// Set when PDFium could not be loaded; the app shows why instead of the editor.
     broken: Option<String>,
 }
@@ -107,6 +110,8 @@ impl App {
             split: None,
             pad: None,
             script_font: ScriptFont::NotLoaded,
+            v_was_down: false,
+            last_paste: None,
             broken,
         }
     }
@@ -200,6 +205,28 @@ impl App {
         if typing {
             return;
         }
+        // Copy, cut and paste of page objects. egui reports Ctrl+V only when the system clipboard
+        // holds text, so the key itself is watched too.
+        let events = ctx.input(|i| i.events.clone());
+        let mut paste = false;
+        for e in &events {
+            match e {
+                egui::Event::Copy => {
+                    self.ed.copy_selection();
+                }
+                egui::Event::Cut => self.ed.cut_selection(),
+                egui::Event::Paste(_) => paste = true,
+                _ => {}
+            }
+        }
+        let v_down = ctx.input(|i| i.modifiers.command) && ctrl_v_down();
+        // The key and the paste event can arrive in different frames: one press pastes once.
+        let recent = self.last_paste.is_some_and(|t| t.elapsed().as_millis() < 350);
+        if (paste || v_down) && !self.v_was_down && !recent && self.ed.can_paste() {
+            self.ed.paste(self.ed.current);
+            self.last_paste = Some(std::time::Instant::now());
+        }
+        self.v_was_down = v_down || paste;
         let ed = &mut self.ed;
         if ev(cmd_shift(Key::Z)) || ev(cmd(Key::Y)) {
             ed.redo();
@@ -208,6 +235,22 @@ impl App {
         }
         if ev(cmd(Key::A)) {
             ed.select_all();
+        }
+        if ev(cmd(Key::D)) {
+            ed.duplicate_selection();
+        }
+        if ev(cmd(Key::CloseBracket)) {
+            ed.restack(true);
+        }
+        if ev(cmd(Key::OpenBracket)) {
+            ed.restack(false);
+        }
+        if ev(cmd_shift(Key::G))
+            && let crate::editor::Sel::Objects { page, items } = ed.sel.clone()
+            && items.len() == 1
+            && let Some(parts) = ed.ungroup(page, items[0])
+        {
+            ed.sel = crate::editor::Sel::Objects { page, items: parts };
         }
         let mods = ctx.input(|i| i.modifiers);
         if mods.is_none() {
@@ -326,9 +369,18 @@ impl App {
                     if ui.add(egui::Button::new("Select all on page").shortcut_text("Ctrl+A")).clicked() {
                         self.ed.select_all();
                     }
-                    let any = self.ed.sel != crate::editor::Sel::None;
-                    if ui.add_enabled(any, egui::Button::new("Delete")).clicked() {
-                        self.ed.delete_selection();
+                    match self.ed.sel.clone() {
+                        crate::editor::Sel::Objects { page, items } => crate::canvas::object_menu(ui, &mut self.ed, page, &items),
+                        crate::editor::Sel::Annot { .. } => {
+                            if ui.button("Delete").clicked() {
+                                self.ed.delete_selection();
+                            }
+                        }
+                        crate::editor::Sel::None => {}
+                    }
+                    if self.ed.can_paste() && ui.add(egui::Button::new("Paste").shortcut_text("Ctrl+V")).clicked() {
+                        let page = self.ed.current;
+                        self.ed.paste(page);
                     }
                     ui.separator();
                     if ui.button("Change signature…").clicked() {
@@ -632,4 +684,16 @@ impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.save_settings(storage);
     }
+}
+
+/// Is the V key physically down? Used to catch Ctrl+V when the system clipboard holds no text.
+#[cfg(windows)]
+fn ctrl_v_down() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    unsafe { (GetAsyncKeyState(b'V' as i32) as u16 & 0x8000) != 0 }
+}
+
+#[cfg(not(windows))]
+fn ctrl_v_down() -> bool {
+    false
 }

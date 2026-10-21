@@ -40,7 +40,130 @@ enum Drag {
     Ink { page: usize, pts: Vec<(f32, f32)> },
     Image { page: usize, from: Pos2 },
     AnnotMove { page: usize, from: Pos2, rect: Rect },
+    Rotate { page: usize, bbox: Rect, from: Pos2 },
     Pan,
+}
+
+/// The rotate handle sits above the middle of the selection's top edge.
+fn rotate_handle(r: Rect) -> Pos2 {
+    pos2(r.center().x, r.top() - 24.0)
+}
+
+/// Screen angle (degrees, clockwise) of a rotate drag, snapped to 15° steps with Shift.
+fn rotate_angle(bbox: Rect, from: Pos2, to: Pos2, shift: bool) -> f32 {
+    let c = bbox.center();
+    let a0 = (from - c).y.atan2((from - c).x);
+    let a1 = (to - c).y.atan2((to - c).x);
+    let mut deg = (a1 - a0).to_degrees();
+    if deg > 180.0 {
+        deg -= 360.0;
+    } else if deg < -180.0 {
+        deg += 360.0;
+    }
+    if shift { (deg / 15.0).round() * 15.0 } else { deg }
+}
+
+/// Snap distance in screen points.
+const SNAP: f32 = 6.0;
+
+/// Edges and centres the selection can snap to on `page`: the page's own, and those of every other
+/// object. Returns (xs, ys) in screen coordinates.
+fn snap_targets(ed: &Editor, page: usize, m: &Map) -> (Vec<f32>, Vec<f32>) {
+    let (mut xs, mut ys) = (vec![m.r.left(), m.r.center().x, m.r.right()], vec![m.r.top(), m.r.center().y, m.r.bottom()]);
+    let Some(f) = &ed.file else { return (xs, ys) };
+    let skip: &[usize] = match &ed.sel {
+        Sel::Objects { page: sp, items } if *sp == page => items,
+        _ => &[],
+    };
+    for o in f.objects(page).iter().filter(|o| !skip.contains(&o.index)) {
+        let b = quad_bounds(&m.quad(&o.quad));
+        // Page-sized backgrounds would make every edge sticky; leave them out.
+        if b.width() > m.r.width() * 0.9 && b.height() > m.r.height() * 0.9 {
+            continue;
+        }
+        xs.extend([b.left(), b.center().x, b.right()]);
+        ys.extend([b.top(), b.center().y, b.bottom()]);
+    }
+    (xs, ys)
+}
+
+/// The nearest target to any of `values`, as (shift to apply, target), if within SNAP.
+fn snap_axis(values: &[f32], targets: &[f32]) -> Option<(f32, f32)> {
+    let mut best: Option<(f32, f32)> = None;
+    for v in values {
+        for t in targets {
+            let d = t - v;
+            if d.abs() <= SNAP && best.is_none_or(|(b, _)| d.abs() < b.abs()) {
+                best = Some((d, *t));
+            }
+        }
+    }
+    best
+}
+
+/// Snap a moved rect: returns the adjusted offset and the guide lines to draw.
+fn snap_move(ed: &Editor, page: usize, m: &Map, bbox: Rect, d: Vec2, off: bool) -> (Vec2, Vec<[Pos2; 2]>) {
+    if off {
+        return (d, Vec::new());
+    }
+    let (xs, ys) = snap_targets(ed, page, m);
+    let r = bbox.translate(d);
+    let mut d = d;
+    let mut guides = Vec::new();
+    if let Some((dx, x)) = snap_axis(&[r.left(), r.center().x, r.right()], &xs) {
+        d.x += dx;
+        guides.push([pos2(x, m.r.top()), pos2(x, m.r.bottom())]);
+    }
+    if let Some((dy, y)) = snap_axis(&[r.top(), r.center().y, r.bottom()], &ys) {
+        d.y += dy;
+        guides.push([pos2(m.r.left(), y), pos2(m.r.right(), y)]);
+    }
+    (d, guides)
+}
+
+/// Snap the moving edges of a resized rect.
+fn snap_resize(ed: &Editor, page: usize, m: &Map, r: Rect, handle: usize, off: bool) -> (Rect, Vec<[Pos2; 2]>) {
+    if off {
+        return (r, Vec::new());
+    }
+    let (xs, ys) = snap_targets(ed, page, m);
+    let mut r = r;
+    let mut guides = Vec::new();
+    let x_edge = if matches!(handle, 0 | 6 | 7) {
+        Some(r.left())
+    } else if matches!(handle, 2 | 3 | 4) {
+        Some(r.right())
+    } else {
+        None
+    };
+    let y_edge = if matches!(handle, 0 | 1 | 2) {
+        Some(r.top())
+    } else if matches!(handle, 4 | 5 | 6) {
+        Some(r.bottom())
+    } else {
+        None
+    };
+    if let Some(x) = x_edge
+        && let Some((dx, t)) = snap_axis(&[x], &xs)
+    {
+        if matches!(handle, 0 | 6 | 7) {
+            r.min.x += dx
+        } else {
+            r.max.x += dx
+        }
+        guides.push([pos2(t, m.r.top()), pos2(t, m.r.bottom())]);
+    }
+    if let Some(y) = y_edge
+        && let Some((dy, t)) = snap_axis(&[y], &ys)
+    {
+        if matches!(handle, 0 | 1 | 2) {
+            r.min.y += dy
+        } else {
+            r.max.y += dy
+        }
+        guides.push([pos2(m.r.left(), t), pos2(m.r.right(), t)]);
+    }
+    (r, guides)
 }
 
 pub struct View {
@@ -615,7 +738,11 @@ fn interact(
             Tool::Select => {
                 let on_handle = matches!(ed.sel, Sel::Objects { .. })
                     && sel_bounds.is_some_and(|(sp, r)| sp == page && handles(r).iter().any(|h| h.distance(pos) <= HANDLE));
-                if on_handle {
+                let on_rotate =
+                    matches!(ed.sel, Sel::Objects { .. }) && sel_bounds.is_some_and(|(sp, r)| sp == page && rotate_handle(r).distance(pos) <= HANDLE);
+                if on_rotate {
+                    ctx.set_cursor_icon(CursorIcon::Grab);
+                } else if on_handle {
                     let (_, r) = sel_bounds.unwrap();
                     let h = handles(r).iter().position(|h| h.distance(pos) <= HANDLE).unwrap();
                     ctx.set_cursor_icon(resize_cursor(h));
@@ -667,10 +794,18 @@ fn interact(
             if f.annots(page).iter().any(|a| a.index == ai && a.subtype == pdf::ANNOT_TEXT) {
                 ed.edit_note(page, ai);
             }
-        } else if let Some(oi) = object_at(&f.objects(page), &m, pos)
-            && f.objects(page).iter().any(|o| o.index == oi && o.kind == Kind::Text)
-        {
-            ed.begin_text_edit(page, oi);
+        } else if let Some(oi) = object_at(&f.objects(page), &m, pos) {
+            match f.objects(page).iter().find(|o| o.index == oi).map(|o| o.kind) {
+                Some(Kind::Text) => ed.begin_text_edit(page, oi),
+                // A group opens into its parts, which can then be edited one by one.
+                Some(Kind::Group) => {
+                    if let Some(items) = ed.ungroup(page, oi) {
+                        ed.sel = Sel::Objects { page, items };
+                        ed.say("Ungrouped. Its parts can now be edited one by one.");
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -678,7 +813,13 @@ fn interact(
     if resp.drag_started()
         && let Some(start) = press
     {
-        ed.view.drag = start_drag(ed, page_at(start), start, sel_bounds);
+        // The rotate handle can sit above the page, so it is checked before the page under it.
+        ed.view.drag = match (&ed.sel, sel_bounds, tool) {
+            (Sel::Objects { .. }, Some((page, r)), Tool::Select) if rotate_handle(r).distance(start) <= HANDLE => {
+                Some(Drag::Rotate { page, bbox: r, from: start })
+            }
+            _ => start_drag(ed, page_at(start), start, sel_bounds),
+        };
     }
     let Some(pos) = pointer.or(resp.interact_pointer_pos()) else { return };
     if resp.dragged() {
@@ -866,14 +1007,36 @@ fn preview(ui: &Ui, ed: &Editor, maps: &HashMap<usize, Map>, pos: Pos2, mods: eg
     let Some(drag) = &ed.view.drag else { return };
     match drag {
         Drag::Move { page, from, bbox } => {
-            let d = pos - *from;
+            let Some(m) = maps.get(page) else { return };
+            let (d, guides) = snap_move(ed, *page, m, *bbox, pos - *from, mods.alt);
             ghost(ed, maps, *page, *bbox, bbox.translate(d), painter);
             painter.rect_stroke(bbox.translate(d), 0.0, accent, StrokeKind::Outside);
+            for g in guides {
+                painter.line_segment(g, Stroke::new(1.0, p.accent));
+            }
         }
         Drag::Resize { page, handle, bbox, keep_aspect, from } => {
+            let Some(m) = maps.get(page) else { return };
             let r = resized(*bbox, *handle, pos - *from, *keep_aspect != mods.shift);
+            let (r, guides) = snap_resize(ed, *page, m, r, *handle, mods.alt);
             ghost(ed, maps, *page, *bbox, r, painter);
             painter.rect_stroke(r, 0.0, accent, StrokeKind::Outside);
+            for g in guides {
+                painter.line_segment(g, Stroke::new(1.0, p.accent));
+            }
+        }
+        Drag::Rotate { bbox, from, .. } => {
+            let deg = rotate_angle(*bbox, *from, pos, mods.shift);
+            let (s, c) = deg.to_radians().sin_cos();
+            let ctr = bbox.center();
+            let rot = |q: Pos2| {
+                let v = q - ctr;
+                ctr + vec2(v.x * c - v.y * s, v.x * s + v.y * c)
+            };
+            let corners = [bbox.left_top(), bbox.right_top(), bbox.right_bottom(), bbox.left_bottom()].map(rot);
+            painter.add(egui::Shape::closed_line(corners.to_vec(), accent));
+            painter.line_segment([ctr, pos], Stroke::new(1.0, p.accent.gamma_multiply(0.6)));
+            painter.text(pos + vec2(14.0, -14.0), egui::Align2::LEFT_BOTTOM, format!("{:.0}°", -deg), egui::FontId::proportional(12.0), p.accent_text);
         }
         Drag::AnnotMove { rect, from, .. } => {
             painter.rect_stroke(rect.translate(pos - *from), 2.0, accent, StrokeKind::Outside);
@@ -955,17 +1118,34 @@ fn ghost(ed: &Editor, maps: &HashMap<usize, Map>, page: usize, src: Rect, dst: R
 fn finish_drag(ed: &mut Editor, d: Drag, maps: &HashMap<usize, Map>, pos: Pos2, mods: egui::Modifiers) {
     let press_moved = |from: Pos2| (pos - from).length() > 2.0;
     match d {
-        Drag::Move { page, from, .. } => {
+        Drag::Move { page, from, bbox } => {
             let Some(m) = maps.get(&page) else { return };
             if press_moved(from) {
-                let (a, b) = (m.user(from), m.user(pos));
+                let (d, _) = snap_move(ed, page, m, bbox, pos - from, mods.alt);
+                let (a, b) = (m.user(from), m.user(from + d));
                 ed.move_selection(b.0 - a.0, b.1 - a.1);
             }
         }
         Drag::Resize { page, handle, bbox, keep_aspect, from } => {
             let Some(m) = maps.get(&page) else { return };
             let r = resized(bbox, handle, pos - from, keep_aspect != mods.shift);
+            let (r, _) = snap_resize(ed, page, m, r, handle, mods.alt);
             ed.reshape_selection(m.user_rect(bbox), m.user_rect(r));
+        }
+        Drag::Rotate { page, bbox, from } => {
+            let Some(m) = maps.get(&page) else { return };
+            let deg = rotate_angle(bbox, from, pos, mods.shift);
+            if deg.abs() < 0.2 {
+                return;
+            }
+            // Screen angles turn clockwise with y down; the page's own axes may be flipped.
+            let o = m.g.to_view(0.0, 0.0);
+            let ex = m.g.to_view(1.0, 0.0);
+            let ey = m.g.to_view(0.0, 1.0);
+            let det = (ex.0 - o.0) * (ey.1 - o.1) - (ex.1 - o.1) * (ey.0 - o.0);
+            let user_deg = deg as f64 * det.signum() as f64;
+            let c = m.user(bbox.center());
+            ed.rotate_selection(user_deg, (c.0 as f64, c.1 as f64));
         }
         Drag::AnnotMove { page, from, .. } => {
             let Some(m) = maps.get(&page) else { return };
@@ -1056,6 +1236,11 @@ fn overlays(ui: &Ui, ed: &mut Editor, maps: &HashMap<usize, Map>, pointer: Optio
                     painter.rect_filled(hr, 1.5, Color32::WHITE);
                     painter.rect_stroke(hr, 1.5, Stroke::new(1.2, p.accent), StrokeKind::Inside);
                 }
+                // Rotate handle on a short stalk above the top edge.
+                let rh = rotate_handle(r);
+                painter.line_segment([pos2(r.center().x, r.top()), rh], Stroke::new(1.0, p.accent));
+                painter.circle_filled(rh, HANDLE / 2.0 + 0.5, Color32::WHITE);
+                painter.circle_stroke(rh, HANDLE / 2.0 + 0.5, Stroke::new(1.2, p.accent));
             }
         } else {
             painter.rect_stroke(r.expand(1.0), 3.0, Stroke::new(1.5, p.accent), StrokeKind::Outside);
@@ -1122,9 +1307,19 @@ fn editors(ui: &mut Ui, ed: &mut Editor, maps: &HashMap<usize, Map>) {
                 Rect::from_min_size(base - vec2(0.0, size * 0.95), vec2(40.0, size * 1.25))
             }
         };
-        let lines = t.text.lines().count().max(1) as f32;
-        let width = rect.width().max(size * 0.6 * t.text.lines().map(|l| l.chars().count()).max().unwrap_or(0) as f32 + 24.0).max(120.0);
-        let r = Rect::from_min_size(rect.min - vec2(4.0, 3.0), vec2(width + 8.0, (size * 1.25 * lines).max(rect.height()) + 6.0));
+        let r = match &t.paragraph {
+            // A paragraph keeps its width; the box grows downwards as the text wraps.
+            Some(para) => {
+                let pr = m.rect(para.rect);
+                let est_lines = (t.text.chars().count() as f32 * size * 0.5 / pr.width().max(40.0)).ceil() + t.text.matches('\n').count() as f32;
+                Rect::from_min_size(pr.min - vec2(4.0, 3.0), vec2(pr.width() + 8.0, (est_lines.max(1.0) * size * 1.3).max(pr.height()) + 6.0))
+            }
+            None => {
+                let lines = t.text.lines().count().max(1) as f32;
+                let width = rect.width().max(size * 0.6 * t.text.lines().map(|l| l.chars().count()).max().unwrap_or(0) as f32 + 24.0).max(120.0);
+                Rect::from_min_size(rect.min - vec2(4.0, 3.0), vec2(width + 8.0, (size * 1.25 * lines).max(rect.height()) + 6.0))
+            }
+        };
         ui.painter().rect_filled(r, 3.0, Color32::WHITE);
         ui.painter().rect_stroke(r, 3.0, Stroke::new(1.5, p.accent), StrokeKind::Outside);
         let edit = egui::TextEdit::multiline(&mut t.text)
@@ -1261,6 +1456,56 @@ fn editors(ui: &mut Ui, ed: &mut Editor, maps: &HashMap<usize, Map>) {
     }
 }
 
+/// Actions for selected page objects, shared by the right-click menu and the Edit menu.
+pub fn object_menu(ui: &mut Ui, ed: &mut Editor, page: usize, items: &[usize]) {
+    let kinds: Vec<Kind> = ed.file.as_ref().map(|f| f.objects(page).iter().filter(|o| items.contains(&o.index)).map(|o| o.kind).collect()).unwrap_or_default();
+    let item = |ui: &mut Ui, label: &str, keys: &str| ui.add(egui::Button::new(label).shortcut_text(keys)).clicked();
+    if kinds == [Kind::Text] && ui.button("Edit text").clicked() {
+        ed.begin_text_edit(page, items[0]);
+        ui.close();
+    }
+    if kinds == [Kind::Group] && item(ui, "Ungroup", "Ctrl+Shift+G") {
+        if let Some(parts) = ed.ungroup(page, items[0]) {
+            ed.sel = Sel::Objects { page, items: parts };
+        }
+        ui.close();
+    }
+    if item(ui, "Copy", "Ctrl+C") {
+        ed.copy_selection();
+        ui.close();
+    }
+    if item(ui, "Cut", "Ctrl+X") {
+        ed.cut_selection();
+        ui.close();
+    }
+    if item(ui, "Duplicate", "Ctrl+D") {
+        ed.duplicate_selection();
+        ui.close();
+    }
+    ui.separator();
+    if item(ui, "Bring to front", "Ctrl+]") {
+        ed.restack(true);
+        ui.close();
+    }
+    if item(ui, "Send to back", "Ctrl+[") {
+        ed.restack(false);
+        ui.close();
+    }
+    if ui.button("Rotate 90° left").clicked() {
+        ed.rotate_selection_quarter(1);
+        ui.close();
+    }
+    if ui.button("Rotate 90° right").clicked() {
+        ed.rotate_selection_quarter(-1);
+        ui.close();
+    }
+    ui.separator();
+    if ui.add(egui::Button::new(egui::RichText::new("Delete").color(pal(ui.ctx()).danger)).shortcut_text("Del")).clicked() {
+        ed.delete_selection();
+        ui.close();
+    }
+}
+
 fn context_menu(ed: &mut Editor, resp: &egui::Response, page_at: &dyn Fn(Pos2) -> Option<(usize, Map)>) {
     if resp.secondary_clicked()
         && let Some((page, m)) = resp.interact_pointer_pos().and_then(page_at)
@@ -1283,17 +1528,7 @@ fn context_menu(ed: &mut Editor, resp: &egui::Response, page_at: &dyn Fn(Pos2) -
     resp.context_menu(|ui| {
         match ed.sel.clone() {
             Sel::Objects { page, items } => {
-                if items.len() == 1
-                    && ed.file.as_ref().is_some_and(|f| f.objects(page).iter().any(|o| o.index == items[0] && o.kind == Kind::Text))
-                    && ui.button("Edit text").clicked()
-                {
-                    ed.begin_text_edit(page, items[0]);
-                    ui.close();
-                }
-                if ui.button(egui::RichText::new("Delete").color(pal(ui.ctx()).danger)).clicked() {
-                    ed.delete_selection();
-                    ui.close();
-                }
+                object_menu(ui, ed, page, &items);
                 ui.separator();
             }
             Sel::Annot { page, index } => {
@@ -1312,6 +1547,10 @@ fn context_menu(ed: &mut Editor, resp: &egui::Response, page_at: &dyn Fn(Pos2) -
         }
         let page = ed.current;
         ui.label(theme::secondary(ui, format!("Page {}", page + 1)));
+        if ed.can_paste() && ui.add(egui::Button::new("Paste").shortcut_text("Ctrl+V")).clicked() {
+            ed.paste(page);
+            ui.close();
+        }
         if ui.button("Rotate page right").clicked() {
             ed.page_sel = vec![page];
             ed.rotate_pages(1);

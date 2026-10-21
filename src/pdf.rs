@@ -341,6 +341,20 @@ impl Doc {
         f
     }
 
+    /// Width of `text` in `font` at `size` (text space), from the font's glyph widths.
+    pub fn font_text_width(font: FPDF_FONT, text: &str, size: f32) -> f32 {
+        if font.is_null() {
+            return text.chars().count() as f32 * size * 0.5;
+        }
+        text.chars()
+            .map(|c| {
+                let mut w = 0.0;
+                let ok = unsafe { lib().FPDFFont_GetGlyphWidth(font, c as u32, size, &mut w) };
+                if ok != 0 { w } else { size * 0.5 }
+            })
+            .sum()
+    }
+
     /// A TrueType font file embedded with full Unicode coverage.
     pub fn truetype_font(&self, path: &Path) -> Option<FPDF_FONT> {
         let key = path.to_string_lossy().into_owned();
@@ -791,6 +805,33 @@ impl<'d> Page<'d> {
         }
         self.touch();
         Some(self.object_count() - 1)
+    }
+
+    /// Draw page `src_page` of `src` on this page as one group (a form XObject), placed by `m`.
+    /// PDFium copies the fonts and images it needs. Returns the new object's index.
+    pub fn insert_page_as_group(&self, src: &Doc, src_page: usize, m: [f32; 6]) -> Option<usize> {
+        let l = lib();
+        unsafe {
+            let x = l.FPDF_NewXObjectFromPage(self.doc.h, src.h, src_page as c_int);
+            if x.is_null() {
+                return None;
+            }
+            let o = l.FPDF_NewFormObjectFromXObject(x);
+            l.FPDF_CloseXObject(x);
+            if o.is_null() {
+                return None;
+            }
+            let fm = FS_MATRIX { a: m[0], b: m[1], c: m[2], d: m[3], e: m[4], f: m[5] };
+            l.FPDFPageObj_SetMatrix(o, &fm);
+            l.FPDFPage_InsertObject(self.h, o);
+        }
+        self.touch();
+        Some(self.object_count() - 1)
+    }
+
+    /// Width of `text` set in object `i`'s font at `size`, in text space (no spacing or scaling).
+    pub fn text_width(&self, i: usize, text: &str, size: f32) -> f32 {
+        Doc::font_text_width(self.font_handle(i), text, size)
     }
 
     // ── paths ──

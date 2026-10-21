@@ -633,6 +633,12 @@ fn object_props(ui: &mut Ui, ed: &mut Editor, page: usize, items: Vec<usize>) {
             Kind::Group => {
                 drop(pg);
                 ui.label(theme::secondary(ui, "A group of items stored together in the file. It moves and resizes as one."));
+                if ui.button("Ungroup to edit its parts").clicked() {
+                    if let Some(parts) = ed.ungroup(page, o.index) {
+                        ed.sel = Sel::Objects { page, items: parts };
+                    }
+                    return;
+                }
             }
             Kind::Shading => {
                 drop(pg);
@@ -640,6 +646,26 @@ fn object_props(ui: &mut Ui, ed: &mut Editor, page: usize, items: Vec<usize>) {
         }
     }
 
+    theme::heading(ui, "ARRANGE");
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Bring to front").clicked() {
+            ed.restack(true);
+        }
+        if ui.button("Send to back").clicked() {
+            ed.restack(false);
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("↺ 90°").on_hover_text("Rotate left").clicked() {
+            ed.rotate_selection_quarter(1);
+        }
+        if ui.button("↻ 90°").on_hover_text("Rotate right").clicked() {
+            ed.rotate_selection_quarter(-1);
+        }
+        if ui.button("Duplicate").clicked() {
+            ed.duplicate_selection();
+        }
+    });
     ui.add_space(10.0);
     if ui.button(RichText::new("Delete").color(p.danger)).clicked() {
         ed.delete_selection();

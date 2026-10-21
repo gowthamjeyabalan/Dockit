@@ -179,7 +179,10 @@ pub fn paint_mark(painter: &egui::Painter, rect: egui::Rect, ink: Color32, dot: 
             let rgba: Vec<u8> = alpha.iter().flat_map(|&v| [255, 255, 255, v]).collect();
             egui::ColorImage::from_rgba_unmultiplied([px as usize, px as usize], &rgba)
         };
-        let t = (ctx.load_texture(format!("mark-ink-{px}"), image(a), egui::TextureOptions::LINEAR), ctx.load_texture(format!("mark-dot-{px}"), image(b), egui::TextureOptions::LINEAR));
+        let t = (
+            ctx.load_texture(format!("mark-ink-{px}"), image(a), egui::TextureOptions::LINEAR),
+            ctx.load_texture(format!("mark-dot-{px}"), image(b), egui::TextureOptions::LINEAR),
+        );
         ctx.data_mut(|d| d.insert_temp(id, t.clone()));
         t
     });

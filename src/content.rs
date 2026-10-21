@@ -362,6 +362,9 @@ pub struct TextInfo {
     pub codes: Vec<u8>,
     /// The typical TJ adjustment between words, for fonts that draw no space characters.
     pub word_kern: f64,
+    /// Character and word spacing (Tc, Tw) in effect.
+    pub tc: f64,
+    pub tw: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -494,6 +497,8 @@ pub fn parse(src: &[u8], xobjects: &HashMap<Vec<u8>, XKind>) -> Parsed {
                             next_cont: None,
                             codes: strings.iter().flat_map(|s| s.iter().copied()).collect(),
                             word_kern: word_kern(op.args.last()),
+                            tc: st.tc,
+                            tw: st.tw,
                         }),
                     });
                     last_text_obj = Some(idx);
@@ -613,6 +618,13 @@ pub enum Edit {
     Text(Vec<Piece>),
     /// Draw a different XObject resource.
     XObject(Vec<u8>),
+    /// Replace a text object by these lines, each placed by a user-space text matrix and shown in
+    /// the same font (a rewrapped paragraph).
+    Lines(Vec<(M, Vec<Piece>)>),
+    /// Replace a group (form XObject) by its own drawing commands, already prepared.
+    Inline(Vec<u8>),
+    /// Move this object to the start of the content, behind everything else.
+    ToStart,
 }
 
 pub fn num(v: f64) -> String {
@@ -676,6 +688,72 @@ fn word_kern(v: Option<&Val>) -> f64 {
     gaps[gaps.len() / 2]
 }
 
+/// Operators that put text object `j` back where it was, for when the text before it on the same
+/// line changed length: reset to its line matrix, then shift along the line to its start.
+fn continuation_fix(parsed: &Parsed, starts: &[Option<M>], j: usize) -> Result<String, String> {
+    let tj = parsed.objs[j].text.as_ref().ok_or("The text position is unknown.")?;
+    let start = starts.get(j).copied().flatten().ok_or("The text position is unknown.")?;
+    let (px, py) = origin(&start, tj.rise);
+    let lm = mul(&tj.tlm, &parsed.objs[j].ctm);
+    let (tx, _) = apply(&inv(&lm), px, py);
+    let scale = tj.size * tj.th;
+    Ok(if scale.abs() > 1e-9 {
+        format!("{} Tm [{}] TJ", mat(&tj.tlm), num(-tx * 1000.0 / scale))
+    } else {
+        let x = [start[0], start[1], start[2], start[3], px, py];
+        format!("{} Tm", mat(&mul(&x, &inv(&parsed.objs[j].ctm))))
+    })
+}
+
+/// Give resources new names in a content stream: `renames` maps (resource category, old name)
+/// to the new name. Only the operators that use names are rewritten; everything else is copied.
+pub fn rename_resources(src: &[u8], renames: &HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>) -> Vec<u8> {
+    let ops = tokenize(src);
+    let look = |cat: &[u8], name: &[u8]| renames.get(&(cat.to_vec(), name.to_vec())).cloned();
+    let mut out = Vec::with_capacity(src.len() + 64);
+    let mut pos = 0;
+    for op in &ops {
+        out.extend_from_slice(&src[pos..op.start]);
+        // Which operand is a resource name, and of which category.
+        let target: Option<(usize, &[u8])> = match op.name.as_slice() {
+            b"Tf" => Some((0, b"Font")),
+            b"Do" => Some((0, b"XObject")),
+            b"gs" => Some((0, b"ExtGState")),
+            b"sh" => Some((0, b"Shading")),
+            b"cs" | b"CS" => Some((0, b"ColorSpace")),
+            b"scn" | b"SCN" => Some((op.args.len().saturating_sub(1), b"Pattern")),
+            b"BDC" | b"DP" => Some((1, b"Properties")),
+            _ => None,
+        };
+        let renamed = target.and_then(|(k, cat)| match op.args.get(k) {
+            Some(Val::Name(n)) => look(cat, n).map(|new| (k, new)),
+            _ => None,
+        });
+        match renamed {
+            // Only operators whose operands are all simple values are rebuilt; others stay as they are.
+            Some((k, new)) if op.args.iter().all(|a| matches!(a, Val::Num(_) | Val::Name(_) | Val::Str(_))) => {
+                let parts: Vec<String> = op
+                    .args
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| match a {
+                        _ if i == k => format!("/{}", String::from_utf8_lossy(&new)),
+                        Val::Num(v) => num(*v),
+                        Val::Name(n) => format!("/{}", String::from_utf8_lossy(n)),
+                        Val::Str(s) => hex(s),
+                        _ => String::new(),
+                    })
+                    .collect();
+                out.extend_from_slice(format!("{} {}", parts.join(" "), String::from_utf8_lossy(&op.name)).as_bytes());
+            }
+            _ => out.extend_from_slice(&src[op.start..op.end]),
+        }
+        pos = op.end;
+    }
+    out.extend_from_slice(&src[pos..]);
+    out
+}
+
 /// The start of a PDFium text object without the text rise.
 fn origin(start: &M, rise: f64) -> (f64, f64) {
     (start[4] - rise * start[2], start[5] - rise * start[3])
@@ -696,6 +774,10 @@ pub fn edit(src: &[u8], parsed: &Parsed, starts: &[Option<M>], edits: &[(usize, 
         e.push_str(s);
     };
     let original = |k: usize| String::from_utf8_lossy(&src[ops[k].start..ops[k].end]).into_owned();
+    // Bytes to write before all content (objects sent to the back).
+    let mut prefix_all = String::new();
+    // Raw replacements (inlined groups keep their exact bytes).
+    let mut replace_raw: HashMap<usize, Vec<u8>> = HashMap::new();
 
     // Group the edits by object.
     let mut by_obj: HashMap<usize, Vec<&Edit>> = HashMap::new();
@@ -716,6 +798,52 @@ pub fn edit(src: &[u8], parsed: &Parsed, starts: &[Option<M>], edits: &[(usize, 
         let paint = list.iter().find_map(|e| if let Edit::Paint { fill, stroke } = e { Some((*fill, *stroke)) } else { None });
         let codes = list.iter().find_map(|e| if let Edit::Text(c) = e { Some(c.clone()) } else { None });
         let xobject = list.iter().find_map(|e| if let Edit::XObject(n) = e { Some(n.clone()) } else { None });
+        let lines = list.iter().find_map(|e| if let Edit::Lines(l) = e { Some(l.clone()) } else { None });
+        let inline = list.iter().find_map(|e| if let Edit::Inline(b) = e { Some(b.clone()) } else { None });
+        let to_start = list.iter().any(|e| matches!(e, Edit::ToStart));
+
+        if let Some(bytes) = inline {
+            replace_raw.insert(o.first, bytes);
+            continue;
+        }
+        if to_start && o.first == o.last && o.kind != Kind::Text {
+            // Drawn first, from the default state, with the CTM it had.
+            prefix_all.push_str(&format!("q {} cm {} Q\n", mat(&o.ctm), original(o.first)));
+            replace.insert(o.first, String::new());
+            continue;
+        }
+        if let (Some(lines), Kind::Text) = (&lines, o.kind) {
+            let t = o.text.as_ref().unwrap();
+            let op = &ops[o.first];
+            let mut body = match op.name.as_slice() {
+                b"'" => "T*".to_string(),
+                b"\"" => {
+                    format!("{} Tw {} Tc T*", num(op.args.first().and_then(Val::num).unwrap_or(0.0)), num(op.args.get(1).and_then(Val::num).unwrap_or(0.0)))
+                }
+                _ => String::new(),
+            };
+            // Word spacing stretched the old lines to fit; the new ones are laid out without it.
+            let tw = match op.name.as_slice() {
+                b"\"" => op.args.first().and_then(Val::num).unwrap_or(0.0),
+                _ => t.tw,
+            };
+            if tw != 0.0 {
+                body.push_str(" 0 Tw");
+            }
+            for (m, pieces) in lines {
+                body.push_str(&format!(" {} Tm {}", mat(&mul(m, &inv(&o.ctm))), show_pieces(pieces)));
+            }
+            if tw != 0.0 {
+                body.push_str(&format!(" {} Tw", num(tw)));
+            }
+            body.push_str(&format!(" {} Tm", mat(&t.tlm)));
+            replace.insert(o.first, body.trim().to_string());
+            if let Some(j) = t.next_cont {
+                let fix = continuation_fix(parsed, starts, j)?;
+                push(&mut before, parsed.objs[j].first, &fix);
+            }
+            continue;
+        }
 
         match o.kind {
             Kind::Text => {
@@ -775,18 +903,7 @@ pub fn edit(src: &[u8], parsed: &Parsed, starts: &[Option<M>], edits: &[(usize, 
                 // Text that continued from this object's end needs its start restored.
                 let advance_changed = delete || codes.is_some() || moved_text;
                 if let (true, Some(j)) = (advance_changed, t.next_cont) {
-                    let tj = parsed.objs[j].text.as_ref().unwrap();
-                    let start = starts.get(j).copied().flatten().ok_or("The text position is unknown.")?;
-                    let (px, py) = origin(&start, tj.rise);
-                    let lm = mul(&tj.tlm, &parsed.objs[j].ctm);
-                    let (tx, _) = apply(&inv(&lm), px, py);
-                    let scale = tj.size * tj.th;
-                    let fix = if scale.abs() > 1e-9 {
-                        format!("{} Tm [{}] TJ", mat(&tj.tlm), num(-tx * 1000.0 / scale))
-                    } else {
-                        let x = [start[0], start[1], start[2], start[3], px, py];
-                        format!("{} Tm", mat(&mul(&x, &inv(&parsed.objs[j].ctm))))
-                    };
+                    let fix = continuation_fix(parsed, starts, j)?;
                     push(&mut before, parsed.objs[j].first, &fix);
                 }
             }
@@ -879,6 +996,7 @@ pub fn edit(src: &[u8], parsed: &Parsed, starts: &[Option<M>], edits: &[(usize, 
 
     // Write: original bytes between operators, edited operators where needed.
     let mut out = Vec::with_capacity(src.len() + 256);
+    out.extend_from_slice(prefix_all.as_bytes());
     let mut pos = 0;
     for (i, op) in ops.iter().enumerate() {
         out.extend_from_slice(&src[pos..op.start]);
@@ -886,9 +1004,10 @@ pub fn edit(src: &[u8], parsed: &Parsed, starts: &[Option<M>], edits: &[(usize, 
             out.extend_from_slice(b.as_bytes());
             out.push(b'\n');
         }
-        match replace.get(&i) {
-            Some(r) => out.extend_from_slice(r.as_bytes()),
-            None => out.extend_from_slice(&src[op.start..op.end]),
+        match (replace_raw.get(&i), replace.get(&i)) {
+            (Some(r), _) => out.extend_from_slice(r),
+            (None, Some(r)) => out.extend_from_slice(r.as_bytes()),
+            (None, None) => out.extend_from_slice(&src[op.start..op.end]),
         }
         if let Some(a) = after.get(&i) {
             out.extend_from_slice(a.as_bytes());

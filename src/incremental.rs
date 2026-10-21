@@ -170,10 +170,12 @@ fn last_startxref(bytes: &[u8]) -> Option<usize> {
     digits.parse().ok()
 }
 
+/// Resources to add to a page: (category such as "Font", name, value).
+pub type ExtraResources = Vec<(Vec<u8>, Vec<u8>, Object)>;
+
 /// Append an update that gives the page `new_content`, plus any new image XObjects
-/// (resource name → stream) added to its resources.
-pub fn write_update(bytes: &[u8], data: &PageData, new_content: &[u8], new_xobjects: Vec<(Vec<u8>, Stream)>) -> Result<Vec<u8>, String> {
-    let prev = last_startxref(bytes).ok_or("The file has no cross-reference table.")?;
+/// (resource name → stream) and other resources added to its resources.
+pub fn write_update(bytes: &[u8], data: &PageData, new_content: &[u8], new_xobjects: Vec<(Vec<u8>, Stream)>, extra: ExtraResources) -> Result<Vec<u8>, String> {
     let doc = &data.doc;
     let mut next_id = doc.max_id + 1;
     let mut objects: Vec<(ObjectId, Object)> = Vec::new();
@@ -186,7 +188,7 @@ pub fn write_update(bytes: &[u8], data: &PageData, new_content: &[u8], new_xobje
 
     let mut page = doc.get_dictionary(data.page_id).map_err(|_| "The page could not be read.")?.clone();
     page.set("Contents", Object::Reference(content_id));
-    if !new_xobjects.is_empty() {
+    if !new_xobjects.is_empty() || !extra.is_empty() {
         let mut res = resources(doc, data.page_id);
         let mut xo = sub_dict(doc, &res, b"XObject");
         for (name, mut s) in new_xobjects {
@@ -203,10 +205,73 @@ pub fn write_update(bytes: &[u8], data: &PageData, new_content: &[u8], new_xobje
             xo.set(name, Object::Reference(id));
         }
         res.set("XObject", Object::Dictionary(xo));
+        for (cat, name, value) in extra {
+            let mut d = sub_dict(doc, &res, &cat);
+            d.set(name, value);
+            res.set(cat, Object::Dictionary(d));
+        }
         page.set("Resources", Object::Dictionary(res));
     }
     objects.push((data.page_id, Object::Dictionary(page)));
+    append(bytes, doc, objects, next_id)
+}
 
+/// A group's own content, ready to be drawn in place of its `Do`: wrapped in its /Matrix and
+/// clipped to its /BBox, with its resources renamed so they cannot clash with the page's.
+/// Returns the content and the resources to add to the page.
+pub fn ungroup(data: &PageData, name: &[u8]) -> Result<(Vec<u8>, ExtraResources), String> {
+    let doc = &data.doc;
+    let res = resources(doc, data.page_id);
+    let xo = sub_dict(doc, &res, b"XObject");
+    let s = xo.get(name).ok().map(|o| resolve(doc, o)).and_then(|o| o.as_stream().ok()).ok_or("The group's contents could not be found.")?;
+    let content = if s.dict.get(b"Filter").is_ok() {
+        s.decompressed_content().map_err(|_| "The group's drawing uses compression Dockit cannot read.")?
+    } else {
+        s.content.clone()
+    };
+    let nums = |key: &[u8]| -> Option<Vec<f64>> {
+        let a = s.dict.get(key).ok().map(|o| resolve(doc, o))?.as_array().ok()?;
+        a.iter().map(|v| v.as_float().map(|f| f as f64).ok().or_else(|| v.as_i64().ok().map(|i| i as f64))).collect()
+    };
+    let matrix = nums(b"Matrix").filter(|m| m.len() == 6).unwrap_or(vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+    let bbox = nums(b"BBox").filter(|b| b.len() == 4);
+
+    // The group's resources move to the page under fresh names (its own resources, if it has
+    // none, are the page's already).
+    let mut renames = std::collections::HashMap::new();
+    let mut extra: ExtraResources = Vec::new();
+    if let Some(own) = s.dict.get(b"Resources").ok().map(|o| resolve(doc, o)).and_then(|o| o.as_dict().ok()) {
+        let mut n = 0;
+        for (cat, entries) in own.iter() {
+            let Ok(entries) = resolve(doc, entries).as_dict() else { continue };
+            for (key, value) in entries.iter() {
+                n += 1;
+                let new = format!("Dk{n}{}", String::from_utf8_lossy(key)).into_bytes();
+                renames.insert((cat.clone(), key.clone()), new.clone());
+                extra.push((cat.clone(), new, value.clone()));
+            }
+        }
+    }
+    let body = crate::content::rename_resources(&content, &renames);
+    let mut out = Vec::new();
+    let m: Vec<String> = matrix.iter().map(|v| crate::content::num(*v)).collect();
+    out.extend_from_slice(format!("q {} cm ", m.join(" ")).as_bytes());
+    if let Some(b) = bbox {
+        let (x0, y0, x1, y1) = (b[0].min(b[2]), b[1].min(b[3]), b[0].max(b[2]), b[1].max(b[3]));
+        out.extend_from_slice(
+            format!("{} {} {} {} re W n\n", crate::content::num(x0), crate::content::num(y0), crate::content::num(x1 - x0), crate::content::num(y1 - y0))
+                .as_bytes(),
+        );
+    }
+    out.extend_from_slice(&body);
+    out.extend_from_slice(b"\nQ");
+    Ok((out, extra))
+}
+
+/// Append `objects` (new or replacing ones with the same number) as an incremental update.
+/// `size` is one more than the highest object number in use afterwards.
+pub fn append(bytes: &[u8], doc: &lopdf::Document, objects: Vec<(ObjectId, Object)>, size: u32) -> Result<Vec<u8>, String> {
+    let prev = last_startxref(bytes).ok_or("The file has no cross-reference table.")?;
     let mut out = bytes.to_vec();
     if !out.ends_with(b"\n") {
         out.push(b'\n');
@@ -230,12 +295,44 @@ pub fn write_update(bytes: &[u8], data: &PageData, new_content: &[u8], new_xobje
             trailer.set(k.clone(), v.clone());
         }
     }
-    trailer.set("Size", Object::Integer(next_id as i64));
+    trailer.set("Size", Object::Integer(size.max(doc.max_id + 1) as i64));
     trailer.set("Prev", Object::Integer(prev as i64));
     out.extend_from_slice(b"trailer\n");
     write_dict(&mut out, &trailer);
     let _ = write!(out, "\nstartxref\n{xref_at}\n%%EOF\n");
     Ok(out)
+}
+
+/// Files with /NeedAppearances make PDFium redraw every annotation each time a page loads, and
+/// each redraw leaves a new copy in the file. Once Dockit has drawn them (`bytes` were saved after
+/// loading every page), the flag is turned off so that stops. Returns None when nothing changes.
+pub fn clear_need_appearances(bytes: &[u8]) -> Option<Vec<u8>> {
+    let doc = lopdf::Document::load_mem(bytes).ok()?;
+    if doc.is_encrypted() {
+        return None;
+    }
+    let root_id = doc.trailer.get(b"Root").ok()?.as_reference().ok()?;
+    let root = doc.get_dictionary(root_id).ok()?;
+    let form = root.get(b"AcroForm").ok()?;
+    let (form_id, form_dict) = match form {
+        Object::Reference(id) => (Some(*id), doc.get_dictionary(*id).ok()?.clone()),
+        Object::Dictionary(d) => (None, d.clone()),
+        _ => return None,
+    };
+    if !matches!(form_dict.get(b"NeedAppearances"), Ok(Object::Boolean(true))) {
+        return None;
+    }
+    let mut form_dict = form_dict;
+    form_dict.remove(b"NeedAppearances");
+    let changed = match form_id {
+        Some(id) => (id, Object::Dictionary(form_dict)),
+        None => {
+            let mut root = root.clone();
+            root.set("AcroForm", Object::Dictionary(form_dict));
+            (root_id, Object::Dictionary(root))
+        }
+    };
+    append(bytes, &doc, vec![changed], doc.max_id + 1).ok()
 }
 
 /// An image XObject for a picture: JPEG data as is, other pixels compressed with a soft mask for

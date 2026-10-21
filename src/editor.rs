@@ -200,6 +200,8 @@ pub struct TextEdit {
     /// Font size on screen, in view points.
     pub size: f32,
     pub focus: bool,
+    /// Set when a whole paragraph (several lines or pieces) is being edited.
+    pub paragraph: Option<crate::arrange::Paragraph>,
 }
 
 pub struct NoteDraft {
@@ -358,16 +360,19 @@ impl File {
     }
 }
 
+/// Edits, new image XObjects and extra resources for one page change.
+pub type SurgeryPlan = (Vec<(usize, Edit)>, Vec<(Vec<u8>, lopdf::Stream)>, incremental::ExtraResources);
+
 /// A page's content as the file stores it, matched object for object to PDFium's view of it.
-struct PageModel {
-    bytes: Vec<u8>,
-    data: incremental::PageData,
-    parsed: content::Parsed,
-    starts: Vec<Option<content::M>>,
+pub struct PageModel {
+    pub bytes: Vec<u8>,
+    pub data: incremental::PageData,
+    pub parsed: content::Parsed,
+    pub starts: Vec<Option<content::M>>,
 }
 
 impl PageModel {
-    fn load(f: &File, page: usize) -> Result<PageModel, String> {
+    pub fn load(f: &File, page: usize) -> Result<PageModel, String> {
         let bytes = f.doc.save_plain()?;
         let data = incremental::page_data(&bytes, page)?;
         let parsed = content::parse(&data.content, &data.xobjects);
@@ -388,8 +393,16 @@ impl PageModel {
         Ok(PageModel { bytes, data, parsed, starts })
     }
 
+    /// What object `obj`'s font can show: the learned codes, the font's facts and its word gap.
+    pub fn encoding(&self, f: &File, page: usize, obj: usize) -> Option<(std::collections::HashMap<char, Vec<u8>>, content::FontMeta, f64)> {
+        let t = self.parsed.objs.get(obj)?.text.as_ref()?;
+        let meta = self.data.fonts.get(&t.font).cloned().unwrap_or_default();
+        let texts = f.doc.page(page)?.texts();
+        Some((content::learn_encoding(&self.parsed, &texts, &t.font, &meta), meta, t.word_kern))
+    }
+
     /// Codes for `text` in object `obj`'s own font, if every character is available.
-    fn encode(&self, f: &File, page: usize, obj: usize, text: &str) -> Option<Vec<content::Piece>> {
+    pub fn encode(&self, f: &File, page: usize, obj: usize, text: &str) -> Option<Vec<content::Piece>> {
         let t = self.parsed.objs.get(obj)?.text.as_ref()?;
         let meta = self.data.fonts.get(&t.font).cloned().unwrap_or_default();
         let texts = f.doc.page(page)?.texts();
@@ -430,6 +443,8 @@ pub struct Editor {
     pub view: View,
     /// A window the app should open (asked for from inside a panel).
     pub request: Option<Request>,
+    /// Copied page objects.
+    pub clip: Option<crate::arrange::Clip>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -463,6 +478,7 @@ impl Default for Editor {
             epoch: 0,
             view: View::default(),
             request: None,
+            clip: None,
         }
     }
 }
@@ -508,6 +524,7 @@ impl Editor {
         match Doc::open(bytes.clone(), password.as_deref()) {
             Ok(doc) => {
                 self.password = None;
+                let (doc, bytes) = settle_appearances(doc, bytes, password.as_deref());
                 self.file = Some(File::new(doc, bytes, Some(path.to_path_buf()), password));
                 self.after_open();
                 self.recent.retain(|p| p != path);
@@ -771,11 +788,18 @@ impl Editor {
     /// appended to the file as an incremental update. `images` are new image XObjects to add to
     /// the page's resources. Returns false (and says why) if the page could not be changed safely.
     pub fn surgery(&mut self, page: usize, edits: Vec<(usize, Edit)>, images: Vec<(Vec<u8>, lopdf::Stream)>) -> bool {
+        self.surgery_with(page, |_| Ok((edits, images, Vec::new())))
+    }
+
+    /// Like `surgery`, but the edits are worked out from the page's content model first (for
+    /// edits that need to read the file, such as ungrouping).
+    pub fn surgery_with(&mut self, page: usize, plan: impl FnOnce(&PageModel) -> Result<SurgeryPlan, String>) -> bool {
         let Some(f) = &self.file else { return false };
         let was_encrypted = f.doc.encrypted();
         let result = PageModel::load(f, page).and_then(|m| {
+            let (edits, images, extra) = plan(&m)?;
             let new = content::edit(&m.data.content, &m.parsed, &m.starts, &edits)?;
-            incremental::write_update(&m.bytes, &m.data, &new, images)
+            incremental::write_update(&m.bytes, &m.data, &new, images, extra)
         });
         let bytes = match result {
             Ok(b) => b,
@@ -836,18 +860,28 @@ impl Editor {
         let scale = (m[0] * m[3] - m[1] * m[2]).abs().sqrt();
         let size = p.font_size(object) * scale * f.geom(page).map_or(1.0, |g| g.unit());
         drop(p);
-        self.sel = Sel::Objects { page, items: vec![object] };
-        self.text_edit = Some(TextEdit { page, object: Some(object), text, at: (0.0, 0.0), size, focus: true });
+        // Text that is part of a longer paragraph is edited as the whole paragraph.
+        let paragraph = self.paragraph_of(page, object).filter(|para| para.objects.len() > 1);
+        let (text, items) = match &paragraph {
+            Some(para) => (para.text.clone(), para.objects.clone()),
+            None => (text, vec![object]),
+        };
+        self.sel = Sel::Objects { page, items };
+        self.text_edit = Some(TextEdit { page, object: Some(object), text, at: (0.0, 0.0), size, focus: true, paragraph });
     }
 
     pub fn begin_new_text(&mut self, page: usize, at: (f32, f32)) {
         self.commit_edits();
         self.clear_selection();
-        self.text_edit = Some(TextEdit { page, object: None, text: String::new(), at, size: self.style.text_size, focus: true });
+        self.text_edit = Some(TextEdit { page, object: None, text: String::new(), at, size: self.style.text_size, focus: true, paragraph: None });
     }
 
     pub fn commit_text(&mut self) {
         let Some(t) = self.text_edit.take() else { return };
+        if let Some(para) = &t.paragraph {
+            self.commit_paragraph(t.page, para, &t.text);
+            return;
+        }
         match t.object {
             Some(obj) => self.set_object_text(t.page, obj, &t.text),
             None => {
@@ -1337,6 +1371,23 @@ impl Editor {
             Ok(()) => self.say(format!("Saved {} to {}", plural(pages.len(), "page", "pages"), target.file_name().unwrap_or_default().to_string_lossy())),
             Err(e) => self.error = Some(format!("Could not save {}: {e}", target.display())),
         }
+    }
+}
+
+/// For files with /NeedAppearances: draw every annotation's appearance once (by loading each
+/// page), then clear the flag, so PDFium does not redraw them on every load and leave copies
+/// behind. Other files come back unchanged.
+fn settle_appearances(doc: Doc, bytes: Vec<u8>, password: Option<&str>) -> (Doc, Vec<u8>) {
+    if !bytes.windows(15).any(|w| w == b"NeedAppearances") || doc.encrypted() {
+        return (doc, bytes);
+    }
+    for i in 0..doc.page_count() {
+        drop(doc.page(i));
+    }
+    let Some(fixed) = doc.save().ok().and_then(|b| incremental::clear_need_appearances(&b)) else { return (doc, bytes) };
+    match Doc::open(fixed.clone(), password) {
+        Ok(d) => (d, fixed),
+        Err(_) => (doc, bytes),
     }
 }
 
