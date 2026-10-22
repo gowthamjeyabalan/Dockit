@@ -16,6 +16,7 @@ mod docinfo;
 mod editor;
 mod find;
 mod fonts;
+mod forms;
 mod incremental;
 mod instance;
 mod mark;
@@ -30,6 +31,7 @@ mod redact;
 mod security;
 mod settings;
 mod sign;
+mod speech;
 mod theme;
 
 /// Every tool, in the order the Tools panel lists them (used for keyboard shortcuts).

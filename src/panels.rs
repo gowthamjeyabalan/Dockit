@@ -587,6 +587,14 @@ fn signatures_props(ui: &mut Ui, f: &crate::editor::File) {
         if !s.reason.is_empty() {
             ui.label(theme::secondary(ui, format!("Reason: {}", s.reason)));
         }
+        if let Some(c) = s.certifies {
+            let what = match c {
+                1 => "no changes allowed",
+                2 => "only form filling and signing allowed",
+                _ => "form filling, signing and comments allowed",
+            };
+            ui.label(theme::secondary(ui, format!("Certified by its author: {what}")));
+        }
         let status = match (s.valid, s.whole) {
             (false, _) => "The signature does not match the document: it was changed or the signature is damaged.",
             (true, true) => "The document has not changed since it was signed.",
@@ -601,6 +609,84 @@ fn signatures_props(ui: &mut Ui, f: &crate::editor::File) {
     }
 }
 
+/// A text field's rules: a number (and its decimals), an allowed range, required, and a value
+/// worked out from other fields.
+fn rules_ui(ui: &mut Ui, ed: &mut Editor, page: usize, index: usize, field: &pdf::Field, rev: u64) {
+    use crate::forms::{Calc, Rules};
+    let id = egui::Id::new(("field-rules", page, index, rev));
+    let current = Rules::read(field);
+    let mut r: Rules = ui.data(|d| d.get_temp(id)).unwrap_or_else(|| current.clone());
+    theme::heading(ui, "VALUE");
+    let mut number = r.number.is_some();
+    if ui.checkbox(&mut number, "A number").changed() {
+        r.number = number.then_some(2);
+        if !number {
+            r.range = None;
+        }
+    }
+    if let Some(dec) = &mut r.number {
+        ui.horizontal(|ui| {
+            ui.label("Decimals");
+            ui.add(egui::DragValue::new(dec).range(0..=6));
+        });
+        let mut ranged = r.range.is_some();
+        if ui.checkbox(&mut ranged, "Allowed range").changed() {
+            r.range = ranged.then_some((0.0, 100.0));
+        }
+        if let Some((lo, hi)) = &mut r.range {
+            ui.horizontal(|ui| {
+                ui.label("From");
+                ui.add(egui::DragValue::new(lo).speed(1.0));
+                ui.label("to");
+                ui.add(egui::DragValue::new(hi).speed(1.0));
+            });
+        }
+    }
+    ui.checkbox(&mut r.required, "Required");
+    // Worked out from other fields.
+    let others: Vec<String> = ed
+        .file
+        .as_ref()
+        .map(|f| (0..f.page_count()).flat_map(|pg| f.annots(pg).iter().filter_map(|a| a.field.as_ref()).filter(|x| x.kind == pdf::FIELD_TEXT && x.name != field.name).map(|x| x.name.clone()).collect::<Vec<_>>()).collect())
+        .unwrap_or_default();
+    let mut calc = r.calc.is_some();
+    if ui.add_enabled(!others.is_empty(), egui::Checkbox::new(&mut calc, "Worked out from other fields")).changed() {
+        r.calc = calc.then(|| (Calc::Sum, Vec::new()));
+        if calc && r.number.is_none() {
+            r.number = Some(2);
+        }
+    }
+    if let Some((op, names)) = &mut r.calc {
+        egui::ComboBox::from_id_salt(("calc-op", page, index)).selected_text(op.name()).show_ui(ui, |ui| {
+            for c in Calc::ALL {
+                ui.selectable_value(op, c, c.name());
+            }
+        });
+        ui.label(theme::secondary(ui, "of"));
+        egui::ScrollArea::vertical().id_salt(("calc-fields", page, index)).max_height(120.0).show(ui, |ui| {
+            for o in &others {
+                let mut on = names.contains(o);
+                if ui.checkbox(&mut on, o).changed() {
+                    if on {
+                        names.push(o.clone());
+                    } else {
+                        names.retain(|n| n != o);
+                    }
+                }
+            }
+        });
+    }
+    let changed = r != current;
+    if ui.add_enabled(changed, egui::Button::new("Save rules")).clicked() {
+        ed.set_field_rules(page, index, &r);
+        ui.data_mut(|d| d.remove::<Rules>(id));
+    } else if changed {
+        ui.data_mut(|d| d.insert_temp(id, r));
+    } else {
+        ui.data_mut(|d| d.remove::<Rules>(id));
+    }
+}
+
 fn field_props(ui: &mut Ui, ed: &mut Editor, page: usize, index: usize, field: pdf::Field, rev: u64) {
     let p = pal(ui.ctx());
     theme::heading(ui, &field.kind_name().to_uppercase());
@@ -612,6 +698,9 @@ fn field_props(ui: &mut Ui, ed: &mut Editor, page: usize, index: usize, field: p
     set_temp_text(ui, id, name.clone());
     if (resp.lost_focus() || resp.has_focus() && ui.input(|i| i.key_pressed(Key::Enter))) && name.trim() != field.name && !name.trim().is_empty() {
         ed.rename_field(page, index, &name);
+    }
+    if field.kind == pdf::FIELD_TEXT {
+        rules_ui(ui, ed, page, index, &field, rev);
     }
     if matches!(field.kind, pdf::FIELD_COMBO | pdf::FIELD_LIST) {
         theme::heading(ui, "CHOICES");
@@ -1008,9 +1097,22 @@ enum CommentAction {
 pub fn form_ui(ui: &mut Ui, ed: &mut Editor) {
     let Some(f) = &ed.file else { return no_document(ui) };
     if !f.doc.has_form() {
-        ui.label(theme::secondary(ui, "This document has no form fields. In Edit PDF, the Form field tool (F) adds them."));
+        ui.label(theme::secondary(ui, "This document has no form fields. Dockit can look for the blanks, boxes and lines where they belong, or you can draw them with the Form field tool (F)."));
+        if ui.button("Find form fields").clicked() {
+            if !ed.editing {
+                ed.set_editing(true);
+            }
+            if ed.editing {
+                ed.detect_fields();
+            }
+        }
         return;
     }
+    let missing = ed.empty_required();
+    if !missing.is_empty() {
+        ui.label(RichText::new(format!("{} still empty: {}", plural(missing.len(), "required field is", "required fields are"), missing.join(", "))).color(pal(ui.ctx()).warning).size(12.0));
+    }
+    let f = ed.file.as_ref().unwrap();
     let n = f.page_count();
     let mut fields = Vec::new();
     for page in 0..n {

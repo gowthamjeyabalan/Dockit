@@ -111,6 +111,7 @@ pub struct App {
     sanitize: Option<crate::docinfo::SanitizeDialog>,
     attachments: Option<crate::docinfo::AttachmentsDialog>,
     batch: Option<crate::batch::BatchDialog>,
+    reader: Option<crate::speech::Reader>,
     autosave: crate::recovery::Autosave,
     settings_win: crate::settings::SettingsWindow,
     /// Files handed over by later launches (double-clicked in Explorer).
@@ -173,6 +174,7 @@ impl App {
             sanitize: None,
             attachments: None,
             batch: None,
+            reader: None,
             autosave: Default::default(),
             settings_win: Default::default(),
             incoming: broken_none.then(|| crate::instance::listen(cc.egui_ctx.clone())),
@@ -545,6 +547,18 @@ impl App {
                 Some(f) => f.focus = true,
                 None => ed.find = Some(crate::find::Find::open()),
             },
+            Cmd::ReadAloud => {
+                if self.reader.take().is_none() {
+                    match crate::speech::Reader::new() {
+                        Ok(mut r) => {
+                            if r.start(&self.ed) {
+                                self.reader = Some(r);
+                            }
+                        }
+                        Err(e) => self.ed.error = Some(e),
+                    }
+                }
+            }
             Cmd::DarkPages => {
                 ed.view_prefs.dark_pages = !ed.view_prefs.dark_pages;
                 ed.reset_view_caches();
@@ -640,6 +654,7 @@ impl App {
             Cmd::Sanitize => self.sanitize = Some(crate::docinfo::SanitizeDialog::new()),
             Cmd::Attachments => self.attachments = Some(crate::docinfo::AttachmentsDialog::new()),
             Cmd::Batch => self.batch = Some(crate::batch::BatchDialog::new()),
+            Cmd::DetectFields => ed.detect_fields(),
             Cmd::Settings => self.settings_win.open = true,
             Cmd::Tool(t) => panels::choose_tool(ed, t),
         }
@@ -757,6 +772,8 @@ impl App {
                 ui.separator();
                 let dark = self.ed.view_prefs.dark_pages;
                 self.check_item(ui, Cmd::DarkPages, dark);
+                let reading = self.reader.is_some();
+                self.check_item(ui, Cmd::ReadAloud, reading);
                 ui.separator();
                 self.item(ui, Cmd::Palette);
                 self.item(ui, Cmd::ResetPanels);
@@ -774,6 +791,7 @@ impl App {
                 ui.separator();
                 self.item(ui, Cmd::Properties);
                 self.item(ui, Cmd::Attachments);
+                self.item(ui, Cmd::DetectFields);
                 ui.separator();
                 self.item(ui, Cmd::Security);
                 self.item(ui, Cmd::Tool(Tool::Redact));
@@ -1085,6 +1103,11 @@ impl eframe::App for App {
             && !crate::batch::batch_window(&ctx, d)
         {
             self.batch = None;
+        }
+        if let Some(r) = &mut self.reader
+            && !crate::speech::reader_bar(&ctx, &mut self.ed, r)
+        {
+            self.reader = None;
         }
         if self.ed.find.is_some() && !crate::find::find_bar(&ctx, &mut self.ed) {
             self.ed.find = None;

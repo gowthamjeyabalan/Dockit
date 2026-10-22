@@ -1747,19 +1747,31 @@ impl Editor {
     }
 
     pub fn set_field_text(&mut self, page: usize, index: usize, text: &str) {
-        let old = self.file.as_ref().and_then(|f| f.annots(page).get(index).and_then(|a| a.field.as_ref().map(|x| x.value.clone())));
-        if old.as_deref() == Some(text) {
+        let Some(field) = self.file.as_ref().and_then(|f| f.annots(page).get(index).and_then(|a| a.field.clone())) else { return };
+        // The field's rules (a number, a range) decide what it may hold, and how it shows.
+        let label = if field.name.is_empty() { "This field".to_string() } else { field.name.clone() };
+        let text = match crate::forms::Rules::read(&field).check(&label, text) {
+            Ok(t) => t,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        if field.value == text {
             return;
         }
-        self.apply(page, |p| p.set_field_text(index, text));
+        self.apply(page, |p| p.set_field_text(index, &text));
+        self.recalculate();
     }
 
     pub fn click_field(&mut self, page: usize, index: usize) {
         self.apply(page, |p| p.click_field(index));
+        self.recalculate();
     }
 
     pub fn select_option(&mut self, page: usize, index: usize, option: usize) {
         self.apply(page, |p| p.select_option(index, option));
+        self.recalculate();
     }
 
     // ── signatures ──

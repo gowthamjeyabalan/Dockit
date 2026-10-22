@@ -99,18 +99,39 @@ impl Signer {
         }
     }
 
-    /// A detached CMS (PKCS #7) signature of `data`, with SHA-256 and the signer's certificate.
+    /// A detached CMS (PKCS #7) signature of `data`, with SHA-256 and the signer's certificate
+    /// chain (as far as Windows can build it), so readers can check it without looking anything up.
     pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>, String> {
         unsafe {
-            let mut cert = self.cert as *mut CERT_CONTEXT;
+            let mut certs: Vec<*mut CERT_CONTEXT> = vec![self.cert as *mut CERT_CONTEXT];
+            let mut chain_para = std::mem::zeroed::<CERT_CHAIN_PARA>();
+            chain_para.cbSize = std::mem::size_of::<CERT_CHAIN_PARA>() as u32;
+            let mut chain: *mut CERT_CHAIN_CONTEXT = null_mut();
+            if CertGetCertificateChain(null_mut(), self.cert, null(), self.store, &chain_para, 0, null(), &mut chain) != 0 && !chain.is_null() && (*chain).cChain > 0 {
+                let simple = &**(*chain).rgpChain;
+                for k in 1..simple.cElement as usize {
+                    let el = &**simple.rgpElement.add(k);
+                    certs.push(el.pCertContext as *mut CERT_CONTEXT);
+                }
+            }
+            let result = self.sign_with(data, &mut certs);
+            if !chain.is_null() {
+                CertFreeCertificateChain(chain);
+            }
+            result
+        }
+    }
+
+    unsafe fn sign_with(&self, data: &[u8], certs: &mut [*mut CERT_CONTEXT]) -> Result<Vec<u8>, String> {
+        unsafe {
             let para = CRYPT_SIGN_MESSAGE_PARA {
                 cbSize: std::mem::size_of::<CRYPT_SIGN_MESSAGE_PARA>() as u32,
                 dwMsgEncodingType: ENCODING,
                 pSigningCert: self.cert,
                 HashAlgorithm: CRYPT_ALGORITHM_IDENTIFIER { pszObjId: SHA256.as_ptr() as *mut u8, Parameters: CRYPT_INTEGER_BLOB { cbData: 0, pbData: null_mut() } },
                 pvHashAuxInfo: null_mut(),
-                cMsgCert: 1,
-                rgpMsgCert: &mut cert,
+                cMsgCert: certs.len() as u32,
+                rgpMsgCert: certs.as_mut_ptr(),
                 cMsgCrl: 0,
                 rgpMsgCrl: null_mut(),
                 cAuthAttr: 0,
@@ -234,6 +255,8 @@ pub struct SigInfo {
     pub whole: bool,
     /// Windows trusts the certificate (it chains to a trusted root).
     pub trusted: bool,
+    /// A certifying signature's lock: 1 no changes, 2 forms and signing, 3 also comments.
+    pub certifies: Option<u32>,
 }
 
 /// Check every signature in a file, as its bytes are on disk.
@@ -241,7 +264,15 @@ pub fn verify_all(bytes: &[u8], doc: &Doc) -> Vec<SigInfo> {
     doc.signatures()
         .into_iter()
         .map(|s| {
-            let mut info = SigInfo { signer: String::new(), reason: s.reason, time: annots::show_date(&s.time), valid: false, whole: false, trusted: false };
+            let mut info = SigInfo {
+                signer: String::new(),
+                reason: s.reason,
+                time: annots::show_date(&s.time),
+                valid: false,
+                whole: false,
+                trusted: false,
+                certifies: (1..=3).contains(&s.mdp).then_some(s.mdp),
+            };
             let r = &s.byte_range;
             if r.len() != 4 || r.iter().any(|&v| v < 0) {
                 return info;
@@ -300,6 +331,9 @@ pub struct SignRequest {
     pub rect: [f32; 4],
     pub reason: String,
     pub location: String,
+    /// Certify the document as its author, allowing only these changes afterwards: 1 none,
+    /// 2 filling in forms and signing, 3 those and comments.
+    pub certify: Option<u32>,
 }
 
 /// The visible part of a signature, drawn in a w × h box.
@@ -361,7 +395,27 @@ pub fn sign_pdf(bytes: Vec<u8>, req: &SignRequest, signer: &Signer) -> Result<Ve
     if !req.location.trim().is_empty() {
         v.set("Location", annots::text_string(req.location.trim()));
     }
+    if let Some(p) = req.certify {
+        // DocMDP: the document's author locks what later changes are allowed.
+        let mut params = Dictionary::new();
+        params.set("Type", Object::Name(b"TransformParams".to_vec()));
+        params.set("P", Object::Integer(p as i64));
+        params.set("V", Object::Name(b"1.2".to_vec()));
+        let mut sref = Dictionary::new();
+        sref.set("Type", Object::Name(b"SigRef".to_vec()));
+        sref.set("TransformMethod", Object::Name(b"DocMDP".to_vec()));
+        sref.set("TransformParams", Object::Dictionary(params));
+        v.set("Reference", Object::Array(vec![Object::Dictionary(sref)]));
+    }
     let v_id = u.add(Object::Dictionary(v));
+    if req.certify.is_some() {
+        let root_id = u.doc.trailer.get(b"Root").and_then(Object::as_reference).map_err(|_| "The document catalog is missing.".to_string())?;
+        let mut cat = u.dict(root_id)?;
+        let mut perms = Dictionary::new();
+        perms.set("DocMDP", Object::Reference(v_id));
+        cat.set("Perms", Object::Dictionary(perms));
+        u.put(root_id, Object::Dictionary(cat));
+    }
 
     let (w, h) = (rect[2] - rect[0], rect[3] - rect[1]);
     let ap = u.add(Object::Stream(appearance(w, h, &signer.name, &annots::show_date(&date), &req.reason)));
@@ -421,6 +475,10 @@ pub struct SignDialog {
     /// Chosen field, or None for a new box on the current page.
     choice: Option<usize>,
     making: Option<NewCert>,
+    /// Certify as the author, with the changes allowed afterwards.
+    certify: Option<u32>,
+    /// The document has signatures already, so it can no longer be certified.
+    signed: bool,
     error: Option<String>,
 }
 
@@ -455,6 +513,8 @@ impl SignDialog {
             fields,
             choice,
             making: None,
+            certify: None,
+            signed: ed.file.as_ref().is_some_and(|f| !f.signatures.is_empty()),
             error: None,
         }
     }
@@ -518,6 +578,27 @@ pub fn sign_window(ctx: &egui::Context, ed: &mut Editor, d: &mut SignDialog) -> 
                 ui.selectable_value(&mut d.choice, Some(k), format!("{} (page {})", f.2, f.0 + 1));
             }
             ui.selectable_value(&mut d.choice, None, here);
+        });
+        theme::heading(ui, "CERTIFY");
+        ui.add_enabled_ui(!d.signed, |ui| {
+            let mut on = d.certify.is_some();
+            if ui.checkbox(&mut on, "Certify as the document's author").on_disabled_hover_text("Only the first signature can certify a document.").changed() {
+                d.certify = on.then_some(2);
+            }
+            if let Some(c) = &mut d.certify {
+                egui::ComboBox::from_id_salt("certify-level")
+                    .width(ui.available_width() - 8.0)
+                    .selected_text(match *c {
+                        1 => "No changes allowed",
+                        2 => "Allow filling in forms and signing",
+                        _ => "Allow forms, signing and comments",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(c, 1, "No changes allowed");
+                        ui.selectable_value(c, 2, "Allow filling in forms and signing");
+                        ui.selectable_value(c, 3, "Allow forms, signing and comments");
+                    });
+            }
         });
         theme::heading(ui, "DETAILS");
         labeled(ui, "Reason", &mut d.reason, false);
@@ -604,7 +685,7 @@ fn sign_now(ed: &mut Editor, d: &SignDialog, pfx: &Path) -> Result<bool, String>
         dlg = dlg.set_directory(dir);
     }
     let Some(out) = dlg.save_file() else { return Ok(false) };
-    let req = SignRequest { page, field, rect, reason: d.reason.clone(), location: d.location.clone() };
+    let req = SignRequest { page, field, rect, reason: d.reason.clone(), location: d.location.clone(), certify: d.certify };
     let signed = sign_pdf(f.doc.save_plain()?, &req, &signer)?;
     std::fs::write(&out, &signed).map_err(|e| format!("{} could not be written ({e}).", out.display()))?;
     ed.style.pfx = Some(pfx.to_path_buf());
@@ -633,7 +714,7 @@ mod tests {
 
         let doc = Doc::new_empty();
         assert!(doc.insert_blank(0, 300.0, 300.0));
-        let req = SignRequest { page: 0, field: None, rect: [50.0, 50.0, 250.0, 110.0], reason: "Testing".into(), location: String::new() };
+        let req = SignRequest { page: 0, field: None, rect: [50.0, 50.0, 250.0, 110.0], reason: "Testing".into(), location: String::new(), certify: Some(2) };
         let signed = sign_pdf(doc.save().unwrap(), &req, &signer).unwrap();
         let back = Doc::open(signed.clone(), None).unwrap();
         let sigs = verify_all(&signed, &back);
@@ -641,6 +722,7 @@ mod tests {
         assert!(sigs[0].valid && sigs[0].whole, "{:?}", sigs[0]);
         assert_eq!(sigs[0].signer, "Dockit Tester");
         assert!(!sigs[0].trusted);
+        assert_eq!(sigs[0].certifies, Some(2));
 
         // Any change to the signed bytes breaks it.
         let mut tampered = signed.clone();

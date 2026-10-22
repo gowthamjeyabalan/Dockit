@@ -119,6 +119,8 @@ pub struct RawSignature {
     pub reason: String,
     /// PDF date string.
     pub time: String,
+    /// Certifying signature's permission (1 to 3), or 0.
+    pub mdp: u32,
 }
 
 #[derive(Debug)]
@@ -369,7 +371,8 @@ impl Doc {
                 l.FPDFSignatureObj_GetByteRange(s, byte_range.as_mut_ptr(), count as c_ulong);
                 let reason = read_wide(|b, n| l.FPDFSignatureObj_GetReason(s, b as *mut c_void, n));
                 let time = read_narrow(|b, n| l.FPDFSignatureObj_GetTime(s, b, n as c_ulong) as usize);
-                Some(RawSignature { contents, byte_range, reason, time })
+                let mdp = l.FPDFSignatureObj_GetDocMDPPermission(s);
+                Some(RawSignature { contents, byte_range, reason, time, mdp })
             })
             .collect()
     }
@@ -605,6 +608,11 @@ pub struct Field {
     pub checked: bool,
     pub flags: i32,
     pub options: Vec<(String, bool)>,
+    /// Scripts run on typing, for showing, for checking and for working out the value.
+    pub keystroke_js: String,
+    pub format_js: String,
+    pub validate_js: String,
+    pub calc_js: String,
 }
 
 impl Field {
@@ -909,6 +917,28 @@ impl<'d> Page<'d> {
     }
 
     // ── page objects ──
+
+    /// The points of path object `i` in user space: (x, y, kind, closes) where kind is 0 line,
+    /// 1 curve point, 2 move.
+    pub fn path_points(&self, i: usize) -> Vec<(f32, f32, i32, bool)> {
+        let l = lib();
+        let o = self.obj(i);
+        let m = self.matrix(i);
+        unsafe {
+            (0..l.FPDFPath_CountSegments(o).max(0))
+                .filter_map(|k| {
+                    let s = l.FPDFPath_GetPathSegment(o, k);
+                    if s.is_null() {
+                        return None;
+                    }
+                    let (mut x, mut y) = (0.0f32, 0.0f32);
+                    l.FPDFPathSegment_GetPoint(s, &mut x, &mut y);
+                    let (ux, uy) = (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]);
+                    Some((ux, uy, l.FPDFPathSegment_GetType(s), l.FPDFPathSegment_GetClose(s) != 0))
+                })
+                .collect()
+        }
+    }
 
     /// Every character of the text layer that belongs to a text object, in reading order, with
     /// the object it comes from.
@@ -1417,6 +1447,10 @@ impl<'d> Page<'d> {
                         checked: matches!(kind, FIELD_CHECKBOX | FIELD_RADIO) && l.FPDFAnnot_IsChecked(form, a) != 0,
                         flags: l.FPDFAnnot_GetFormFieldFlags(form, a),
                         options,
+                        keystroke_js: read_wide(|b, n| l.FPDFAnnot_GetFormAdditionalActionJavaScript(form, a, 12, b, n)),
+                        format_js: read_wide(|b, n| l.FPDFAnnot_GetFormAdditionalActionJavaScript(form, a, 13, b, n)),
+                        validate_js: read_wide(|b, n| l.FPDFAnnot_GetFormAdditionalActionJavaScript(form, a, 14, b, n)),
+                        calc_js: read_wide(|b, n| l.FPDFAnnot_GetFormAdditionalActionJavaScript(form, a, 15, b, n)),
                     }
                 });
                 let (lo, hi) = (r.bottom.min(r.top), r.bottom.max(r.top));

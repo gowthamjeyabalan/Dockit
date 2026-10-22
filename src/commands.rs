@@ -85,6 +85,7 @@ pub enum Cmd {
     Palette,
     Find,
     DarkPages,
+    ReadAloud,
     // Tools
     Combine,
     Split,
@@ -100,6 +101,7 @@ pub enum Cmd {
     Sanitize,
     Attachments,
     Batch,
+    DetectFields,
     // Settings
     Settings,
     Tool(Tool),
@@ -146,6 +148,7 @@ impl Cmd {
             Cmd::Palette => "Command palette".into(),
             Cmd::Find => "Find…".into(),
             Cmd::DarkPages => "Dark pages".into(),
+            Cmd::ReadAloud => "Read aloud".into(),
             Cmd::Combine => "Combine files…".into(),
             Cmd::Split => "Split into files…".into(),
             Cmd::FromImages => "Create a PDF from images…".into(),
@@ -160,6 +163,7 @@ impl Cmd {
             Cmd::Sanitize => "Remove hidden information…".into(),
             Cmd::Attachments => "Attached files…".into(),
             Cmd::Batch => "Batch process…".into(),
+            Cmd::DetectFields => "Find form fields".into(),
             Cmd::Settings => "Settings".into(),
             Cmd::Tool(t) => format!("{} tool", t.name()),
         }
@@ -174,6 +178,7 @@ impl Cmd {
             Cmd::Print => "printer paper",
             Cmd::Find => "search text look for",
             Cmd::DarkPages => "night reading invert dark mode",
+            Cmd::ReadAloud => "speak voice listen speech",
             Cmd::ToggleEdit => "edit done reading",
             Cmd::Combine => "merge join",
             Cmd::Split => "separate",
@@ -188,6 +193,7 @@ impl Cmd {
             Cmd::Sanitize => "sanitize clean metadata privacy scripts",
             Cmd::Attachments => "embedded files attach",
             Cmd::Batch => "many files folder automate action",
+            Cmd::DetectFields => "detect automatic form fields fillable",
             Cmd::Crop => "trim margins paper size",
             Cmd::Stamp => "bates header footer watermark numbers",
             Cmd::Layout(_) | Cmd::CoverPage => "view layout pages spread book",
@@ -226,6 +232,7 @@ impl Cmd {
                 | Cmd::Bates
                 | Cmd::FindRedact
                 | Cmd::Sanitize
+                | Cmd::DetectFields
                 | Cmd::Tool(_)
         )
     }
@@ -263,6 +270,7 @@ pub fn sections() -> Vec<(&'static str, Vec<Cmd>)> {
                 Cmd::Layout(PageLayout::TwoContinuous),
                 Cmd::CoverPage,
                 Cmd::DarkPages,
+                Cmd::ReadAloud,
                 Cmd::Palette,
             ],
         ),
@@ -279,6 +287,7 @@ pub fn sections() -> Vec<(&'static str, Vec<Cmd>)> {
                 Cmd::Bates,
                 Cmd::Properties,
                 Cmd::Attachments,
+                Cmd::DetectFields,
                 Cmd::Security,
                 Cmd::FindRedact,
                 Cmd::Sanitize,
@@ -366,6 +375,7 @@ pub fn default_combo(c: Cmd) -> Option<Combo> {
         Cmd::Palette => ctrl(K),
         Cmd::Find => ctrl(F),
         Cmd::Print => ctrl(P),
+        Cmd::ReadAloud => ctrl_shift(R),
         Cmd::Settings => ctrl(Comma),
         Cmd::Tool(t) => Some(Combo::new(t.key(), false, false)),
         _ => None,
