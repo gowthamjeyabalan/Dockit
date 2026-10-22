@@ -298,6 +298,59 @@ impl Doc {
         if ok != 0 { Ok(w.out) } else { Err("PDFium could not write the document.".into()) }
     }
 
+    /// A document information entry ("Title", "Author", "Subject", "Keywords", "Creator",
+    /// "Producer", "CreationDate", "ModDate").
+    pub fn meta(&self, tag: &str) -> String {
+        let l = lib();
+        read_wide(|b, n| unsafe { l.FPDF_GetMetaText(self.h, tag, b as *mut c_void, n) })
+    }
+
+    /// Embedded files: their names and sizes.
+    pub fn attachments(&self) -> Vec<(String, usize)> {
+        let l = lib();
+        let n = unsafe { l.FPDFDoc_GetAttachmentCount(self.h) }.max(0);
+        (0..n)
+            .filter_map(|i| unsafe {
+                let a = l.FPDFDoc_GetAttachment(self.h, i);
+                if a.is_null() {
+                    return None;
+                }
+                let name = read_wide(|b, n| l.FPDFAttachment_GetName(a, b, n));
+                let mut len: c_ulong = 0;
+                l.FPDFAttachment_GetFile(a, null_mut(), 0, &mut len);
+                Some((name, len as usize))
+            })
+            .collect()
+    }
+
+    /// The contents of embedded file `i`.
+    pub fn attachment_data(&self, i: usize) -> Option<Vec<u8>> {
+        let l = lib();
+        unsafe {
+            let a = l.FPDFDoc_GetAttachment(self.h, i as c_int);
+            if a.is_null() {
+                return None;
+            }
+            let mut len: c_ulong = 0;
+            l.FPDFAttachment_GetFile(a, null_mut(), 0, &mut len);
+            let mut buf = vec![0u8; len as usize];
+            (l.FPDFAttachment_GetFile(a, buf.as_mut_ptr() as *mut c_void, len, &mut len) != 0).then_some(buf)
+        }
+    }
+
+    pub fn add_attachment(&self, name: &str, data: &[u8]) -> bool {
+        let l = lib();
+        unsafe {
+            let w = wide(name);
+            let a = l.FPDFDoc_AddAttachment(self.h, w.as_ptr());
+            !a.is_null() && l.FPDFAttachment_SetFile(a, self.h, data.as_ptr() as *const c_void, data.len() as c_ulong) != 0
+        }
+    }
+
+    pub fn delete_attachment(&self, i: usize) -> bool {
+        unsafe { lib().FPDFDoc_DeleteAttachment(self.h, i as c_int) != 0 }
+    }
+
     /// The document's digital signatures, as stored.
     pub fn signatures(&self) -> Vec<RawSignature> {
         let l = lib();
@@ -782,6 +835,47 @@ impl<'d> Page<'d> {
             l.FPDFText_ClosePage(tp);
         }
         out
+    }
+
+    /// The text layer as a string, with the character index each byte of it comes from.
+    pub fn chars_text(&self) -> (String, Vec<usize>) {
+        let l = lib();
+        let mut s = String::new();
+        let mut at = Vec::new();
+        unsafe {
+            let tp = l.FPDFText_LoadPage(self.h);
+            if tp.is_null() {
+                return (s, at);
+            }
+            for i in 0..l.FPDFText_CountChars(tp).max(0) {
+                let c = char::from_u32(l.FPDFText_GetUnicode(tp, i)).unwrap_or(' ');
+                let c = if c == '\r' { ' ' } else { c };
+                s.push(c);
+                at.extend(std::iter::repeat_n(i as usize, c.len_utf8()));
+            }
+            l.FPDFText_ClosePage(tp);
+        }
+        (s, at)
+    }
+
+    /// The boxes (l, b, r, t) covering `count` characters of the text layer from `start`.
+    pub fn text_rects(&self, start: usize, count: usize) -> Vec<[f32; 4]> {
+        let l = lib();
+        unsafe {
+            let tp = l.FPDFText_LoadPage(self.h);
+            if tp.is_null() {
+                return Vec::new();
+            }
+            let n = l.FPDFText_CountRects(tp, start as c_int, count as c_int);
+            let out = (0..n.max(0))
+                .filter_map(|k| {
+                    let (mut a, mut t, mut r, mut b) = (0.0, 0.0, 0.0, 0.0);
+                    (l.FPDFText_GetRect(tp, k, &mut a, &mut t, &mut r, &mut b) != 0).then_some([a as f32, b as f32, r as f32, t as f32])
+                })
+                .collect();
+            l.FPDFText_ClosePage(tp);
+            out
+        }
     }
 
     /// The text of characters `a..=b` of the text layer (as numbered by `glyphs`).

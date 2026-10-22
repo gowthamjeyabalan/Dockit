@@ -12,7 +12,7 @@ use crate::theme::{self, UiExt, pal};
 use egui::{RichText, Ui, vec2};
 use std::path::PathBuf;
 
-const MM: f32 = 72.0 / 25.4;
+pub const MM: f32 = 72.0 / 25.4;
 
 /// Which pages a tool works on.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -299,6 +299,14 @@ pub struct StampDialog {
 }
 
 impl StampDialog {
+    /// Only a diagonal watermark, for batch work.
+    pub fn watermark(text: &str) -> Self {
+        let mut d = StampDialog::new();
+        d.footer.clear();
+        d.watermark = text.to_string();
+        d
+    }
+
     pub fn new() -> Self {
         StampDialog {
             header: String::new(),
@@ -342,7 +350,7 @@ fn expand(template: &str, page: usize, pages: usize, file: &str) -> String {
 impl Editor {
     /// Put a line of text on page `i` with its baseline starting at view position `at`, turned by
     /// `degrees` (counter-clockwise as seen). Returns false if no font could be loaded.
-    fn put_text(&mut self, i: usize, at: (f32, f32), degrees: f32, text: &str, size: f32, color: crate::pdf::Rgba) -> bool {
+    pub(crate) fn put_text(&mut self, i: usize, at: (f32, f32), degrees: f32, text: &str, size: f32, color: crate::pdf::Rgba) -> bool {
         let Some(f) = &self.file else { return false };
         let Some(g) = f.geom(i) else { return false };
         let latin = text.chars().all(|c| (c as u32) < 0x100);
@@ -370,14 +378,14 @@ impl Editor {
         true
     }
 
-    fn line_width(&self, text: &str, size: f32) -> f32 {
+    pub(crate) fn line_width(&self, text: &str, size: f32) -> f32 {
         let Some(f) = &self.file else { return 0.0 };
         let latin = text.chars().all(|c| (c as u32) < 0x100);
         let font = if latin { f.doc.standard_font("Helvetica") } else { crate::fonts::generic("sans", false, false).and_then(|p| f.doc.truetype_font(p)).unwrap_or(std::ptr::null_mut()) };
         Doc::font_text_width(font, text, size)
     }
 
-    fn stamp_pages(&mut self, d: &StampDialog, pages: &[usize]) {
+    pub(crate) fn stamp_pages(&mut self, d: &StampDialog, pages: &[usize]) {
         let Some(f) = &self.file else { return };
         let total = f.page_count();
         let name = f.name();

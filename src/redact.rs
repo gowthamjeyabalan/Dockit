@@ -338,9 +338,237 @@ fn blacken(px: &mut [u8], w: u32, h: u32, m: [f32; 6], rects: &[[f32; 4]]) {
     }
 }
 
+// ── finding what to redact ──
+
+/// Kinds of information that can be found and marked across a document.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pattern {
+    Words,
+    Emails,
+    Phones,
+    Cards,
+    Ids,
+    Dates,
+    Custom,
+}
+
+impl Pattern {
+    pub const ALL: [Pattern; 7] = [Pattern::Words, Pattern::Emails, Pattern::Phones, Pattern::Cards, Pattern::Ids, Pattern::Dates, Pattern::Custom];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Pattern::Words => "Words or phrases",
+            Pattern::Emails => "Email addresses",
+            Pattern::Phones => "Phone numbers",
+            Pattern::Cards => "Payment card numbers",
+            Pattern::Ids => "ID numbers (like 123-45-6789)",
+            Pattern::Dates => "Dates",
+            Pattern::Custom => "My own pattern",
+        }
+    }
+
+    fn regex(self) -> &'static str {
+        match self {
+            Pattern::Emails => r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+            Pattern::Phones => r"\+?\(?\d[\d ().-]{6,}\d",
+            Pattern::Cards => r"\b(?:\d[ -]?){12,18}\d\b",
+            Pattern::Ids => r"\b\d{3}-\d{2}-\d{4}\b",
+            Pattern::Dates => r"\b(?:\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{4})\b",
+            Pattern::Words | Pattern::Custom => "",
+        }
+    }
+}
+
+/// The Luhn check digit test, so only real-looking card numbers are taken.
+fn luhn(s: &str) -> bool {
+    let digits: Vec<u32> = s.chars().filter_map(|c| c.to_digit(10)).collect();
+    if !(13..=19).contains(&digits.len()) {
+        return false;
+    }
+    let sum: u32 = digits.iter().rev().enumerate().map(|(k, &d)| if k % 2 == 1 { if d * 2 > 9 { d * 2 - 9 } else { d * 2 } } else { d }).sum();
+    sum % 10 == 0
+}
+
+/// The expression to search with, or why it cannot be built.
+fn search_regex(pattern: Pattern, text: &str, match_case: bool) -> Result<regex::Regex, String> {
+    let source = match pattern {
+        Pattern::Words => {
+            let words: Vec<String> = text.lines().map(str::trim).filter(|w| !w.is_empty()).map(regex::escape).collect();
+            if words.is_empty() {
+                return Err("Type the words to find, one per line.".into());
+            }
+            format!("(?:{})", words.join("|"))
+        }
+        Pattern::Custom => {
+            if text.trim().is_empty() {
+                return Err("Type a pattern (a regular expression).".into());
+            }
+            text.trim().to_string()
+        }
+        p => p.regex().to_string(),
+    };
+    regex::RegexBuilder::new(&source).case_insensitive(!match_case).build().map_err(|e| format!("That pattern does not work: {e}"))
+}
+
+impl Editor {
+    /// Every place on every page that matches: (page, the boxes it covers).
+    pub fn find_for_redaction(&self, pattern: Pattern, text: &str, match_case: bool) -> Result<Vec<(usize, Vec<[f32; 4]>)>, String> {
+        let re = search_regex(pattern, text, match_case)?;
+        let f = self.file.as_ref().ok_or("No document is open.")?;
+        let mut out = Vec::new();
+        for page in 0..f.page_count() {
+            let Some(p) = f.doc.page(page) else { continue };
+            let (s, at) = p.chars_text();
+            for m in re.find_iter(&s) {
+                if m.as_str().trim().is_empty() || (pattern == Pattern::Cards && !luhn(m.as_str())) {
+                    continue;
+                }
+                let (a, b) = (at[m.start()], at[m.end() - 1]);
+                let rects = p.text_rects(a, b - a + 1);
+                if !rects.is_empty() {
+                    out.push((page, rects));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Mark many areas for redaction at once.
+    pub fn add_redactions(&mut self, areas: &[(usize, [f32; 4])]) -> usize {
+        let mut pages: Vec<usize> = areas.iter().map(|a| a.0).collect();
+        pages.sort_unstable();
+        pages.dedup();
+        self.file_update(&pages, |u| {
+            for &(page, r) in areas {
+                // A little room around the letters, so nothing peeks out.
+                let (d, ap) = mark([r[0] - 1.0, r[1] - 1.0, r[2] + 1.0, r[3] + 1.0]);
+                u.push_annot(page, d, Some(ap))?;
+            }
+            Ok(areas.len())
+        })
+        .unwrap_or(0)
+    }
+}
+
+pub struct FindRedactDialog {
+    pattern: Pattern,
+    text: String,
+    match_case: bool,
+    found: Option<Vec<(usize, Vec<[f32; 4]>)>>,
+    error: Option<String>,
+}
+
+impl FindRedactDialog {
+    pub fn new() -> Self {
+        FindRedactDialog { pattern: Pattern::Words, text: String::new(), match_case: false, found: None, error: None }
+    }
+}
+
+/// Returns false when it closes.
+pub fn find_redact_window(ctx: &egui::Context, ed: &mut Editor, d: &mut FindRedactDialog) -> bool {
+    use crate::dialogs::{modal, primary, secondary_button, title};
+    use crate::theme::{self, pal};
+    let p = pal(ctx);
+    let mut open = true;
+    let mut search = false;
+    let mut mark_all = false;
+    let (_, close) = modal(ctx, "find-redact", 440.0, |ui| {
+        title(ui, "Find and redact");
+        ui.label(theme::secondary(ui, "Finds words or kinds of information on every page and marks them for redaction. Check the marks, then apply them."));
+        theme::heading(ui, "FIND");
+        let before = (d.pattern, d.text.clone(), d.match_case);
+        egui::ComboBox::from_id_salt("redact-pattern").width(ui.available_width() - 8.0).selected_text(d.pattern.name()).show_ui(ui, |ui| {
+            for pt in Pattern::ALL {
+                ui.selectable_value(&mut d.pattern, pt, pt.name());
+            }
+        });
+        match d.pattern {
+            Pattern::Words => {
+                ui.add(egui::TextEdit::multiline(&mut d.text).desired_rows(3).desired_width(f32::INFINITY).hint_text("One word or phrase per line"));
+                ui.checkbox(&mut d.match_case, "Match case");
+            }
+            Pattern::Custom => {
+                ui.add(egui::TextEdit::singleline(&mut d.text).desired_width(f32::INFINITY).hint_text(r"A regular expression, such as INV-\d{6}"));
+                ui.checkbox(&mut d.match_case, "Match case");
+            }
+            _ => {}
+        }
+        if before != (d.pattern, d.text.clone(), d.match_case) {
+            d.found = None;
+        }
+        if let Some(found) = &d.found {
+            let pages = {
+                let mut v: Vec<usize> = found.iter().map(|f| f.0).collect();
+                v.dedup();
+                v.len()
+            };
+            ui.add_space(4.0);
+            ui.label(if found.is_empty() { "Nothing found.".to_string() } else { format!("Found {} on {}.", plural(found.len(), "match", "matches"), plural(pages, "page", "pages")) });
+        }
+        if let Some(e) = &d.error {
+            ui.label(egui::RichText::new(e).color(p.danger));
+        }
+        ui.add_space(12.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            match &d.found {
+                Some(f) if !f.is_empty() => {
+                    if primary(ui, "Mark for redaction", true) {
+                        mark_all = true;
+                    }
+                }
+                _ => {
+                    if primary(ui, "Find", true) {
+                        search = true;
+                    }
+                }
+            }
+            if secondary_button(ui, "Cancel") {
+                open = false;
+            }
+        });
+    });
+    if close {
+        open = false;
+    }
+    if search {
+        match ed.find_for_redaction(d.pattern, &d.text, d.match_case) {
+            Ok(found) => {
+                d.error = None;
+                d.found = Some(found);
+            }
+            Err(e) => d.error = Some(e),
+        }
+    }
+    if mark_all && let Some(found) = d.found.take() {
+        let areas: Vec<(usize, [f32; 4])> = found.iter().flat_map(|(page, rs)| rs.iter().map(|r| (*page, *r))).collect();
+        let n = ed.add_redactions(&areas);
+        if n > 0 {
+            ed.tool = crate::editor::Tool::Redact;
+            ed.say(format!("Marked {} for redaction. Check them, then use Apply redactions.", plural(found.len(), "match", "matches")));
+            if let Some(&(page, _)) = found.first() {
+                ed.goto = Some(page);
+            }
+        }
+        open = false;
+    }
+    open
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn patterns_find_what_they_should() {
+        let find = |p: Pattern, s: &str| search_regex(p, "", false).unwrap().find(s).map(|m| m.as_str().to_string());
+        assert_eq!(find(Pattern::Emails, "write to ana.li@example.co.uk today").as_deref(), Some("ana.li@example.co.uk"));
+        assert_eq!(find(Pattern::Ids, "SSN 123-45-6789.").as_deref(), Some("123-45-6789"));
+        assert_eq!(find(Pattern::Dates, "due 2026-10-22 or 3 March 2027").as_deref(), Some("2026-10-22"));
+        assert!(luhn("4111 1111 1111 1111"));
+        assert!(!luhn("4111 1111 1111 1112"));
+        let words = search_regex(Pattern::Words, "secret\nAcme Corp", false).unwrap();
+        assert_eq!(words.find_iter("The ACME corp secret").count(), 2);
+    }
 
     /// Reports whether DOCKIT_WORD appears anywhere in DOCKIT_INSPECT, in any stream or string,
     /// decompressed (run with --ignored).

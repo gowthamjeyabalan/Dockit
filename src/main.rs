@@ -4,12 +4,15 @@
 
 mod annots;
 mod app;
+mod batch;
+mod bates;
 mod arrange;
 mod canvas;
 mod commands;
 mod compare;
 mod content;
 mod dialogs;
+mod docinfo;
 mod editor;
 mod find;
 mod fonts;

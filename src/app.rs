@@ -105,6 +105,12 @@ pub struct App {
     ocr: Option<crate::ocr::OcrDialog>,
     compare: Option<crate::compare::Compare>,
     printing: Option<crate::print::PrintJob>,
+    bates: Option<crate::bates::BatesDialog>,
+    find_redact: Option<crate::redact::FindRedactDialog>,
+    properties: Option<crate::docinfo::PropertiesDialog>,
+    sanitize: Option<crate::docinfo::SanitizeDialog>,
+    attachments: Option<crate::docinfo::AttachmentsDialog>,
+    batch: Option<crate::batch::BatchDialog>,
     autosave: crate::recovery::Autosave,
     settings_win: crate::settings::SettingsWindow,
     /// Files handed over by later launches (double-clicked in Explorer).
@@ -161,6 +167,12 @@ impl App {
             ocr: None,
             compare: None,
             printing: None,
+            bates: None,
+            find_redact: None,
+            properties: None,
+            sanitize: None,
+            attachments: None,
+            batch: None,
             autosave: Default::default(),
             settings_win: Default::default(),
             incoming: broken_none.then(|| crate::instance::listen(cc.egui_ctx.clone())),
@@ -341,7 +353,14 @@ impl App {
     }
 
     fn modal_open(&self) -> bool {
-        self.crop.is_some() || self.stamp.is_some() || self.compress.is_some() || self.security.is_some() || self.sign.is_some() || self.ocr.is_some() || self.recovery.is_some() || self.settings_win.open || self.export.is_some() || self.images.is_some() || self.ask_save.is_some() || self.combine.is_some() || self.split.is_some() || self.pad.is_some() || self.ed.password.is_some() || self.ed.error.is_some()
+        self.crop.is_some() || self.stamp.is_some() || self.compress.is_some() || self.security.is_some() || self.sign.is_some() || self.ocr.is_some() || self.recovery.is_some() || self.settings_win.open
+            || self.bates.is_some()
+            || self.find_redact.is_some()
+            || self.properties.is_some()
+            || self.sanitize.is_some()
+            || self.attachments.is_some()
+            || self.batch.is_some()
+            || self.export.is_some() || self.images.is_some() || self.ask_save.is_some() || self.combine.is_some() || self.split.is_some() || self.pad.is_some() || self.ed.password.is_some() || self.ed.error.is_some()
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -615,6 +634,12 @@ impl App {
             }
             Cmd::Security => self.security = Some(crate::security::SecurityDialog::new(&self.ed)),
             Cmd::SignDigitally => self.sign = Some(crate::sign::SignDialog::new(&self.ed, None)),
+            Cmd::Bates => self.bates = Some(crate::bates::BatesDialog::new()),
+            Cmd::FindRedact => self.find_redact = Some(crate::redact::FindRedactDialog::new()),
+            Cmd::Properties => self.properties = Some(crate::docinfo::PropertiesDialog::new(&self.ed)),
+            Cmd::Sanitize => self.sanitize = Some(crate::docinfo::SanitizeDialog::new()),
+            Cmd::Attachments => self.attachments = Some(crate::docinfo::AttachmentsDialog::new()),
+            Cmd::Batch => self.batch = Some(crate::batch::BatchDialog::new()),
             Cmd::Settings => self.settings_win.open = true,
             Cmd::Tool(t) => panels::choose_tool(ed, t),
         }
@@ -740,13 +765,20 @@ impl App {
                 self.item(ui, Cmd::Combine);
                 self.item(ui, Cmd::Split);
                 self.item(ui, Cmd::FromImages);
+                self.item(ui, Cmd::Batch);
                 ui.separator();
                 self.item(ui, Cmd::Compress);
                 self.item(ui, Cmd::Ocr);
                 self.item(ui, Cmd::Compare);
+                self.item(ui, Cmd::Bates);
+                ui.separator();
+                self.item(ui, Cmd::Properties);
+                self.item(ui, Cmd::Attachments);
                 ui.separator();
                 self.item(ui, Cmd::Security);
                 self.item(ui, Cmd::Tool(Tool::Redact));
+                self.item(ui, Cmd::FindRedact);
+                self.item(ui, Cmd::Sanitize);
                 self.item(ui, Cmd::SignDigitally);
             });
             // Settings has its own place in the bar.
@@ -1024,6 +1056,36 @@ impl eframe::App for App {
         }
 
         crate::settings::show(&ctx, &mut self.settings_win, &mut self.ed, &mut self.appearance);
+        if let Some(d) = &mut self.bates
+            && !crate::bates::bates_window(&ctx, &mut self.ed, d)
+        {
+            self.bates = None;
+        }
+        if let Some(d) = &mut self.find_redact
+            && !crate::redact::find_redact_window(&ctx, &mut self.ed, d)
+        {
+            self.find_redact = None;
+        }
+        if let Some(d) = &mut self.properties
+            && !crate::docinfo::properties_window(&ctx, &mut self.ed, d)
+        {
+            self.properties = None;
+        }
+        if let Some(d) = &mut self.sanitize
+            && !crate::docinfo::sanitize_window(&ctx, &mut self.ed, d)
+        {
+            self.sanitize = None;
+        }
+        if let Some(d) = &mut self.attachments
+            && !crate::docinfo::attachments_window(&ctx, &mut self.ed, d)
+        {
+            self.attachments = None;
+        }
+        if let Some(d) = &mut self.batch
+            && !crate::batch::batch_window(&ctx, d)
+        {
+            self.batch = None;
+        }
         if self.ed.find.is_some() && !crate::find::find_bar(&ctx, &mut self.ed) {
             self.ed.find = None;
         }

@@ -132,6 +132,26 @@ impl Editor {
     }
 }
 
+/// Recognize every page that has no text yet, waiting for each (for batch work). Returns the
+/// number of words added.
+pub fn ocr_document(ed: &mut Editor, lang: Option<&str>) -> Result<usize, String> {
+    let n = ed.file.as_ref().map_or(0, |f| f.page_count());
+    let mut words = 0;
+    for page in 0..n {
+        let Some(f) = &ed.file else { break };
+        if f.glyphs(page).len() > 20 {
+            continue;
+        }
+        let (w, h) = f.sizes[page];
+        let scale = (300.0 / 72.0f32).min(max_side() as f32 / w.max(h).max(1.0));
+        let Some(img) = f.doc.page(page).and_then(|p| p.render(scale, [0, 0, (w * scale).round() as i32, (h * scale).round() as i32])) else { continue };
+        let bgra: Vec<u8> = img.pixels.iter().flat_map(|c| [c.b(), c.g(), c.r(), c.a()]).collect();
+        let found = recognize(&bgra, img.size[0] as u32, img.size[1] as u32, lang)?;
+        words += ed.add_ocr_words(page, scale, &found);
+    }
+    Ok(words)
+}
+
 // ── the dialog ──
 
 pub struct OcrDialog {

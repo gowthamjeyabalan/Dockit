@@ -874,11 +874,49 @@ impl Editor {
         self.epoch += 1;
     }
 
+    /// Open a file without showing it, for work on many files at once.
+    pub fn open_headless(path: &Path) -> Result<Editor, String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("{} could not be read ({e}).", path.display()))?;
+        match Doc::open(bytes.clone(), None) {
+            Ok(doc) => {
+                let mut ed = Editor::default();
+                ed.file = Some(File::new(doc, bytes, Some(path.to_path_buf()), None));
+                ed.editing = true;
+                Ok(ed)
+            }
+            Err(OpenError::Password) => Err("it is password protected".into()),
+            Err(OpenError::Failed(m)) => Err(m),
+        }
+    }
+
+    /// The bytes to write for the document, protected as its settings say.
+    fn output_bytes(&self) -> Result<Vec<u8>, String> {
+        use crate::security::Security;
+        let f = self.file.as_ref().ok_or("No document is open.")?;
+        match &f.security {
+            Security::Keep => f.doc.save(),
+            Security::Remove => f.doc.save_plain(),
+            Security::Protect(p) => f.doc.save_plain().and_then(|b| crate::security::encrypt(&b, p)),
+        }
+    }
+
+    /// Write the document to `target` (safely: a temporary file, then swapped in).
+    pub fn write_to(&mut self, target: &Path) -> Result<(), String> {
+        self.commit_edits();
+        self.commit();
+        let bytes = self.output_bytes()?;
+        let tmp = target.with_extension("pdf.dockit-tmp");
+        std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, target)).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("Could not save {}: {e}", target.display())
+        })
+    }
+
     /// Write the document to its file, or ask where when `as_new` or untitled. False if cancelled or failed.
     pub fn save(&mut self, as_new: bool) -> bool {
         self.commit_edits();
         self.commit();
-        let Some(f) = &mut self.file else { return false };
+        let Some(f) = &self.file else { return false };
         let target = match (&f.path, as_new) {
             (Some(p), false) => p.clone(),
             _ => {
@@ -892,13 +930,7 @@ impl Editor {
                 }
             }
         };
-        use crate::security::Security;
-        let bytes = match &f.security {
-            Security::Keep => f.doc.save(),
-            Security::Remove => f.doc.save_plain(),
-            Security::Protect(p) => f.doc.save_plain().and_then(|b| crate::security::encrypt(&b, p)),
-        };
-        let bytes = match bytes {
+        let bytes = match self.output_bytes() {
             Ok(b) => b,
             Err(e) => {
                 self.error = Some(e);
@@ -913,6 +945,7 @@ impl Editor {
             self.error = Some(format!("Could not save {}: {e}", target.display()));
             return false;
         }
+        let f = self.file.as_mut().unwrap();
         f.path = Some(target.clone());
         f.saved_at = Some(f.at);
         self.recent.retain(|p| *p != target);

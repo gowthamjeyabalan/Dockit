@@ -94,6 +94,12 @@ pub enum Cmd {
     Compare,
     Security,
     SignDigitally,
+    Bates,
+    FindRedact,
+    Properties,
+    Sanitize,
+    Attachments,
+    Batch,
     // Settings
     Settings,
     Tool(Tool),
@@ -148,6 +154,12 @@ impl Cmd {
             Cmd::Compare => "Compare with another version…".into(),
             Cmd::Security => "Password and permissions…".into(),
             Cmd::SignDigitally => "Sign digitally…".into(),
+            Cmd::Bates => "Bates numbering…".into(),
+            Cmd::FindRedact => "Find and redact…".into(),
+            Cmd::Properties => "Document properties…".into(),
+            Cmd::Sanitize => "Remove hidden information…".into(),
+            Cmd::Attachments => "Attached files…".into(),
+            Cmd::Batch => "Batch process…".into(),
             Cmd::Settings => "Settings".into(),
             Cmd::Tool(t) => format!("{} tool", t.name()),
         }
@@ -170,6 +182,12 @@ impl Cmd {
             Cmd::Compare => "diff differences versions",
             Cmd::Security => "encrypt protect lock restrict",
             Cmd::SignDigitally => "certificate pfx signature",
+            Cmd::Bates => "legal numbers stamp",
+            Cmd::FindRedact => "search remove black out personal email phone",
+            Cmd::Properties => "metadata title author subject keywords info",
+            Cmd::Sanitize => "sanitize clean metadata privacy scripts",
+            Cmd::Attachments => "embedded files attach",
+            Cmd::Batch => "many files folder automate action",
             Cmd::Crop => "trim margins paper size",
             Cmd::Stamp => "bates header footer watermark numbers",
             Cmd::Layout(_) | Cmd::CoverPage => "view layout pages spread book",
@@ -181,7 +199,7 @@ impl Cmd {
 
     /// Needs an open document.
     pub fn needs_doc(self) -> bool {
-        !matches!(self, Cmd::Open | Cmd::Quit | Cmd::Combine | Cmd::FromImages | Cmd::Settings | Cmd::Palette | Cmd::ResetPanels)
+        !matches!(self, Cmd::Open | Cmd::Quit | Cmd::Combine | Cmd::FromImages | Cmd::Settings | Cmd::Palette | Cmd::ResetPanels | Cmd::Batch)
     }
 
     /// Changes the document, so it switches to editing first.
@@ -205,6 +223,9 @@ impl Cmd {
                 | Cmd::Flatten
                 | Cmd::Compress
                 | Cmd::Ocr
+                | Cmd::Bates
+                | Cmd::FindRedact
+                | Cmd::Sanitize
                 | Cmd::Tool(_)
         )
     }
@@ -245,7 +266,25 @@ pub fn sections() -> Vec<(&'static str, Vec<Cmd>)> {
                 Cmd::Palette,
             ],
         ),
-        ("Tools", vec![Cmd::Combine, Cmd::Split, Cmd::FromImages, Cmd::Compress, Cmd::Ocr, Cmd::Compare, Cmd::Security, Cmd::SignDigitally]),
+        (
+            "Tools",
+            vec![
+                Cmd::Combine,
+                Cmd::Split,
+                Cmd::FromImages,
+                Cmd::Batch,
+                Cmd::Compress,
+                Cmd::Ocr,
+                Cmd::Compare,
+                Cmd::Bates,
+                Cmd::Properties,
+                Cmd::Attachments,
+                Cmd::Security,
+                Cmd::FindRedact,
+                Cmd::Sanitize,
+                Cmd::SignDigitally,
+            ],
+        ),
         ("Editing tools", crate::panels_tools().into_iter().map(Cmd::Tool).collect()),
         ("Other", vec![Cmd::Settings]),
     ]
