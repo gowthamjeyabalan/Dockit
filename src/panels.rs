@@ -55,7 +55,7 @@ fn tool_button(ui: &mut Ui, ed: &mut Editor, t: Tool, w: f32) {
     ui.painter().text(
         r.right_center() - vec2(9.0, 0.0),
         egui::Align2::RIGHT_CENTER,
-        format!("{:?}", t.key()),
+        ed.keys.text(crate::commands::Cmd::Tool(t)),
         egui::FontId::new(11.0, egui::FontFamily::Proportional),
         key,
     );

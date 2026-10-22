@@ -9,6 +9,7 @@ use crate::content::{self, Edit};
 use crate::fonts;
 use crate::incremental;
 use crate::annots::{self, NewField};
+use crate::commands::{Keymap, PageLayout};
 use crate::pdf::{self, Annot, Doc, Geom, Glyph, ImageData, Obj, OpenError, Page, PathStyle, Rgba};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -19,7 +20,7 @@ use std::time::Instant;
 /// History is trimmed from the oldest end once the states take more memory than this.
 const HISTORY_BUDGET: usize = 512 * 1024 * 1024;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum Tool {
     Select,
     Text,
@@ -225,6 +226,27 @@ impl Default for Style {
             field: NewField::Text,
             pfx: None,
         }
+    }
+}
+
+/// How documents are shown, remembered between sessions.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ViewPrefs {
+    /// Layout for documents opened for the first time.
+    pub layout: PageLayout,
+    pub cover: bool,
+    /// Reopen each document with the layout it had.
+    pub remember: bool,
+    /// Open documents straight into editing.
+    pub open_editing: bool,
+    /// Layouts of recent documents.
+    pub remembered: Vec<(PathBuf, PageLayout, bool)>,
+}
+
+impl Default for ViewPrefs {
+    fn default() -> Self {
+        ViewPrefs { layout: PageLayout::Continuous, cover: true, remember: true, open_editing: false, remembered: Vec::new() }
     }
 }
 
@@ -587,6 +609,13 @@ pub struct Editor {
     pub clip: Option<crate::arrange::Clip>,
     /// Editing (true) or just reading the document.
     pub editing: bool,
+    pub keys: Keymap,
+    pub palette: Option<crate::palette::Palette>,
+    pub view_prefs: ViewPrefs,
+    /// This document's page layout.
+    pub layout: PageLayout,
+    /// With two pages side by side, the first page stands alone.
+    pub cover: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -624,6 +653,11 @@ impl Default for Editor {
             request: None,
             clip: None,
             editing: false,
+            keys: Keymap::default(),
+            palette: None,
+            view_prefs: ViewPrefs::default(),
+            layout: PageLayout::Continuous,
+            cover: true,
         }
     }
 }
@@ -701,9 +735,14 @@ impl Editor {
         }
     }
 
+    /// The author restricted changes and the owner password has not been given.
+    pub fn restricted(&self) -> bool {
+        self.file.as_ref().is_some_and(|f| f.doc.encrypted() && !crate::security::Allow::from_bits(f.doc.permissions()).edit)
+    }
+
     /// Switch between reading and editing. Leaving editing finishes anything being typed.
     pub fn set_editing(&mut self, on: bool) {
-        if on && !self.editing && let Some(f) = &self.file && f.doc.encrypted() && !crate::security::Allow::from_bits(f.doc.permissions()).edit {
+        if on && !self.editing && self.restricted() && let Some(f) = &self.file {
             // The author restricted changes: the owner password unlocks them.
             if let Some(path) = f.path.clone() {
                 self.password = Some(PasswordAsk { path, bytes: f.history[0].clone(), text: String::new(), wrong: false, owner: true });
@@ -729,8 +768,14 @@ impl Editor {
     }
 
     fn after_open(&mut self) {
-        // Documents open for reading; Edit PDF switches to editing.
+        // Documents open for reading (Edit PDF switches to editing), unless Settings says otherwise.
         self.editing = false;
+        let path = self.file.as_ref().and_then(|f| f.path.clone());
+        let known = path.as_ref().filter(|_| self.view_prefs.remember).and_then(|p| self.view_prefs.remembered.iter().find(|r| &r.0 == p));
+        (self.layout, self.cover) = match known {
+            Some(r) => (r.1, r.2),
+            None => (self.view_prefs.layout, self.view_prefs.cover),
+        };
         self.clear_transient();
         self.page_sel.clear();
         self.current = 0;
@@ -738,6 +783,59 @@ impl Editor {
         self.fit = Some(true);
         self.needs_commit = false;
         self.epoch += 1;
+        if self.view_prefs.open_editing && !self.restricted() {
+            self.set_editing(true);
+        }
+    }
+
+    // ── page layout ──
+
+    /// Show this document with `layout` (and remember it for next time).
+    pub fn set_layout(&mut self, layout: PageLayout, cover: bool) {
+        self.layout = layout;
+        self.cover = cover;
+        self.goto = Some(self.current);
+        if let Some(p) = self.file.as_ref().and_then(|f| f.path.clone()) {
+            let r = &mut self.view_prefs.remembered;
+            r.retain(|x| x.0 != p);
+            r.insert(0, (p, layout, cover));
+            r.truncate(200);
+        }
+    }
+
+    /// The first page of the row (page or spread) that page `i` is in.
+    pub fn row_start(&self, i: usize) -> usize {
+        if !self.layout.two() {
+            return i;
+        }
+        if self.cover {
+            if i == 0 { 0 } else { i - (i - 1) % 2 }
+        } else {
+            i - i % 2
+        }
+    }
+
+    /// The pages in the row starting at `start`.
+    pub fn row_len(&self, start: usize) -> usize {
+        let n = self.file.as_ref().map_or(0, |f| f.page_count());
+        let len = if !self.layout.two() || (self.cover && start == 0) { 1 } else { 2 };
+        len.min(n.saturating_sub(start)).max(1)
+    }
+
+    pub fn next_page(&mut self) {
+        let n = self.file.as_ref().map_or(0, |f| f.page_count());
+        let s = self.row_start(self.current);
+        let next = s + self.row_len(s);
+        if next < n {
+            self.goto = Some(next);
+        }
+    }
+
+    pub fn prev_page(&mut self) {
+        let s = self.row_start(self.current);
+        if s > 0 {
+            self.goto = Some(self.row_start(s - 1));
+        }
     }
 
     /// Open a document that exists only in memory (made from images), not yet saved.

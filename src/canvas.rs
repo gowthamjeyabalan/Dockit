@@ -209,6 +209,11 @@ pub struct View {
     field_menu: Option<(usize, usize, Pos2, u64)>,
     frame: u64,
     viewport: Vec2,
+    /// Wheel movement past the end of a page, building up to a page turn (one page at a time).
+    flip: f32,
+    flipped_at: f64,
+    /// After turning back a page, show its bottom.
+    land_bottom: bool,
 }
 
 impl Default for View {
@@ -224,6 +229,9 @@ impl Default for View {
             field_menu: None,
             frame: 0,
             viewport: vec2(800.0, 600.0),
+            flip: 0.0,
+            flipped_at: 0.0,
+            land_bottom: false,
         }
     }
 }
@@ -406,15 +414,34 @@ fn annot_movable(a: &Annot) -> bool {
     matches!(a.subtype, pdf::ANNOT_TEXT | pdf::ANNOT_FREETEXT | pdf::ANNOT_LINE | pdf::ANNOT_SQUARE | pdf::ANNOT_CIRCLE | pdf::ANNOT_STAMP | pdf::ANNOT_INK)
 }
 
-/// Positions of each page in content coordinates, and the content size.
-fn layout(sizes: &[(f32, f32)], zoom: f32, min_width: f32) -> (Vec<Rect>, Vec2) {
-    let widest = sizes.iter().map(|s| s.0).fold(0.0, f32::max) * zoom + 2.0 * MARGIN;
+/// Positions of each page in content coordinates, and the content size. Pages are laid out in rows
+/// (one page, or a spread of two); one page at a time shows only the current row, and pages not
+/// shown get an empty rect.
+fn layout(ed: &Editor, sizes: &[(f32, f32)], zoom: f32, min_width: f32) -> (Vec<Rect>, Vec2) {
+    let mut rows = Vec::new();
+    let mut i = 0;
+    while i < sizes.len() {
+        let len = ed.row_len(i);
+        rows.push(i..i + len);
+        i += len;
+    }
+    if ed.layout.paged() {
+        let s = ed.row_start(ed.current.min(sizes.len().saturating_sub(1)));
+        rows.retain(|r| r.start == s);
+    }
+    let row_w = |r: &std::ops::Range<usize>| r.clone().map(|k| sizes[k].0 * zoom).sum::<f32>() + GAP * (r.len() as f32 - 1.0);
+    let widest = rows.iter().map(row_w).fold(0.0, f32::max) + 2.0 * MARGIN;
     let width = widest.max(min_width);
+    let mut rects = vec![Rect::NOTHING; sizes.len()];
     let mut y = MARGIN;
-    let mut rects = Vec::with_capacity(sizes.len());
-    for &(w, h) in sizes {
-        let (w, h) = (w * zoom, h * zoom);
-        rects.push(Rect::from_min_size(pos2(((width - w) / 2.0).round(), y.round()), vec2(w, h)));
+    for r in &rows {
+        let mut x = ((width - row_w(r)) / 2.0).round();
+        let h = r.clone().map(|k| sizes[k].1 * zoom).fold(0.0, f32::max);
+        for k in r.clone() {
+            let (w, ph) = (sizes[k].0 * zoom, sizes[k].1 * zoom);
+            rects[k] = Rect::from_min_size(pos2(x, (y + (h - ph) / 2.0).round()), vec2(w, ph));
+            x += w + GAP;
+        }
         y += h + GAP;
     }
     (rects, vec2(width, y - GAP + MARGIN))
@@ -538,10 +565,24 @@ pub fn canvas_ui(ui: &mut Ui, ed: &mut Editor) {
     let avail = ui.available_size();
     ed.view.viewport = avail;
 
-    // Fit requests use the current page's size.
+    // One page (or spread) at a time: going to a page shows its row.
+    if ed.layout.paged()
+        && let Some(g) = ed.goto
+    {
+        let n = ed.file.as_ref().map_or(0, |f| f.page_count());
+        ed.current = g.min(n.saturating_sub(1));
+    }
+
+    // Fit requests use the current page's (or spread's) size.
     if let Some(width) = ed.fit.take() {
         let f = ed.file.as_ref().unwrap();
-        let (w, h) = f.sizes.get(ed.current).copied().unwrap_or((612.0, 792.0));
+        let s = ed.row_start(ed.current);
+        let row: Vec<(f32, f32)> = (s..s + ed.row_len(s)).filter_map(|k| f.sizes.get(k).copied()).collect();
+        let (w, h) = if row.is_empty() {
+            (612.0, 792.0)
+        } else {
+            (row.iter().map(|r| r.0).sum::<f32>() + GAP * (row.len() as f32 - 1.0) / ed.zoom.max(0.01), row.iter().map(|r| r.1).fold(0.0, f32::max))
+        };
         let zw = (avail.x - 2.0 * MARGIN - 14.0) / w;
         let z = if width { zw } else { zw.min((avail.y - 2.0 * MARGIN) / h) };
         ed.zoom = z.clamp(MIN_ZOOM, MAX_ZOOM);
@@ -560,7 +601,10 @@ pub fn canvas_ui(ui: &mut Ui, ed: &mut Editor) {
     let f = ed.file.as_ref().unwrap();
     let sizes = f.sizes.clone();
     let zoom = ed.zoom;
-    let (rects, content) = layout(&sizes, zoom, avail.x);
+    let (rects, content) = layout(ed, &sizes, zoom, avail.x);
+    let paged = ed.layout.paged();
+    // The wheel, for turning pages at the ends of a page shown on its own.
+    let wheel = if paged && hover && !ui.input(|i| i.modifiers.command) { ui.input(|i| i.smooth_scroll_delta.y) } else { 0.0 };
 
     let mut sa = egui::ScrollArea::both().id_salt("document").auto_shrink([false, false]);
     if let Some(o) = ed.view.pending_offset.take() {
@@ -568,7 +612,9 @@ pub fn canvas_ui(ui: &mut Ui, ed: &mut Editor) {
     } else if let Some(g) = ed.goto.take()
         && let Some(r) = rects.get(g)
     {
-        sa = sa.vertical_scroll_offset((r.top() - MARGIN).max(0.0));
+        let top = if paged { 0.0 } else { (r.top() - MARGIN).max(0.0) };
+        let y = if std::mem::take(&mut ed.view.land_bottom) { content.y } else { top };
+        sa = sa.vertical_scroll_offset(y);
     }
 
     let out = sa.show_viewport(ui, |ui, viewport| {
@@ -578,7 +624,7 @@ pub fn canvas_ui(ui: &mut Ui, ed: &mut Editor) {
         let clip = ui.clip_rect();
         painter.rect_filled(clip, 0.0, p.bg);
 
-        let visible: Vec<usize> = (0..rects.len()).filter(|&i| rects[i].intersects(viewport)).collect();
+        let visible: Vec<usize> = (0..rects.len()).filter(|&i| rects[i].is_positive() && rects[i].intersects(viewport)).collect();
         // The current page is the one under the middle of the view.
         let mid = viewport.center().y;
         if let Some(&c) = visible.iter().min_by(|&&a, &&b| {
@@ -639,6 +685,28 @@ pub fn canvas_ui(ui: &mut Ui, ed: &mut Editor) {
         }
     });
     ed.view.offset = out.state.offset;
+
+    // Scrolling on past the end of a page turns to the next one (and back past the top).
+    if paged && wheel != 0.0 {
+        let max = (out.content_size.y - out.inner_rect.height()).max(0.0);
+        let at_top = out.state.offset.y <= 0.5;
+        let at_bottom = out.state.offset.y >= max - 0.5;
+        if (wheel < 0.0 && at_bottom) || (wheel > 0.0 && at_top) {
+            ed.view.flip += wheel;
+        } else {
+            ed.view.flip = 0.0;
+        }
+        if ed.view.flip.abs() > 60.0 && now() - ed.view.flipped_at > 0.3 {
+            if ed.view.flip < 0.0 {
+                ed.next_page();
+            } else {
+                ed.prev_page();
+                ed.view.land_bottom = ed.goto.is_some();
+            }
+            ed.view.flip = 0.0;
+            ed.view.flipped_at = now();
+        }
+    }
 }
 
 /// Make sure a picture of page `i` at the current zoom covers what is visible.

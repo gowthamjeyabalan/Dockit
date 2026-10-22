@@ -2,9 +2,10 @@
 
 use crate::canvas;
 use crate::dialogs::{self, Combine, SaveChoice, SignaturePad, Split};
-use crate::editor::{Editor, Request, Signature, Style, Tool};
+use crate::commands::{Cmd, Keymap, PageLayout};
+use crate::editor::{Editor, Request, Signature, Style, Tool, ViewPrefs};
 use crate::panels;
-use crate::theme::{self, Appearance, UiExt, pal};
+use crate::theme::{self, Appearance, pal};
 use egui::{Key, KeyboardShortcut, Margin, Modifiers, Ui, ViewportCommand, vec2};
 use egui_dock::{DockArea, DockState, NodeIndex, TabStyle, TabViewer};
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,8 @@ struct Settings {
     recent: Vec<PathBuf>,
     style: Option<Style>,
     signature: Option<Signature>,
+    keys: Keymap,
+    view: ViewPrefs,
 }
 
 const SETTINGS_KEY: &str = "dockit-settings";
@@ -102,7 +105,7 @@ pub struct App {
     ocr: Option<crate::ocr::OcrDialog>,
     compare: Option<crate::compare::Compare>,
     autosave: crate::recovery::Autosave,
-    setup: Option<crate::setup::SetupDialog>,
+    settings_win: crate::settings::SettingsWindow,
     /// Files handed over by later launches (double-clicked in Explorer).
     incoming: Option<std::sync::mpsc::Receiver<PathBuf>>,
     recovery: Option<crate::recovery::RecoveryDialog>,
@@ -122,6 +125,8 @@ impl App {
             ed.style = s;
         }
         ed.signature = settings.signature;
+        ed.keys = settings.keys;
+        ed.view_prefs = settings.view;
         if broken.is_none()
             && let Some(arg) = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.exists())
         {
@@ -155,8 +160,8 @@ impl App {
             ocr: None,
             compare: None,
             autosave: Default::default(),
-            setup: None,
-            incoming: broken_none.then(|| crate::setup::listen(cc.egui_ctx.clone())),
+            settings_win: Default::default(),
+            incoming: broken_none.then(|| crate::instance::listen(cc.egui_ctx.clone())),
             recovery: if broken_none {
                 let items = crate::recovery::orphans();
                 (!items.is_empty()).then_some(crate::recovery::RecoveryDialog { items })
@@ -178,6 +183,7 @@ impl App {
         self.ed.commit_edits();
         let clip = self.ed.clip.take();
         let (style, signature, recent) = (self.ed.style.clone(), self.ed.signature.clone(), self.ed.recent.clone());
+        let (keys, view_prefs) = (self.ed.keys.clone(), self.ed.view_prefs.clone());
         std::mem::swap(&mut self.ed, &mut self.tabs[self.active]);
         std::mem::swap(&mut self.ed, &mut self.tabs[j]);
         self.active = j;
@@ -185,12 +191,15 @@ impl App {
         self.ed.style = style;
         self.ed.signature = signature;
         self.ed.recent = recent;
+        self.ed.keys = keys;
+        self.ed.view_prefs = view_prefs;
     }
 
     /// Open a new, empty tab and switch to it.
     fn new_tab(&mut self) {
         let mut fresh = Editor::default();
         fresh.recent = self.ed.recent.clone();
+        fresh.view_prefs = self.ed.view_prefs.clone();
         self.tabs.push(fresh);
         let j = self.tabs.len() - 1;
         self.switch_tab(j);
@@ -330,72 +339,58 @@ impl App {
     }
 
     fn modal_open(&self) -> bool {
-        self.crop.is_some() || self.stamp.is_some() || self.compress.is_some() || self.security.is_some() || self.sign.is_some() || self.ocr.is_some() || self.recovery.is_some() || self.setup.is_some() || self.export.is_some() || self.images.is_some() || self.ask_save.is_some() || self.combine.is_some() || self.split.is_some() || self.pad.is_some() || self.ed.password.is_some() || self.ed.error.is_some()
+        self.crop.is_some() || self.stamp.is_some() || self.compress.is_some() || self.security.is_some() || self.sign.is_some() || self.ocr.is_some() || self.recovery.is_some() || self.settings_win.open || self.export.is_some() || self.images.is_some() || self.ask_save.is_some() || self.combine.is_some() || self.split.is_some() || self.pad.is_some() || self.ed.password.is_some() || self.ed.error.is_some()
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if self.modal_open() {
+        if self.modal_open() || self.settings_win.capturing() || self.ed.palette.is_some() {
             return;
-        }
-        let cmd = |k| KeyboardShortcut::new(Modifiers::COMMAND, k);
-        let cmd_shift = |k| KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, k);
-        let ev = |s: KeyboardShortcut| ctx.input_mut(|i| i.consume_shortcut(&s));
-        if ev(cmd(Key::O)) {
-            self.request(ctx, Pending::Open);
-        }
-        if ev(cmd(Key::W)) && self.ed.file.is_some() {
-            self.request(ctx, Pending::Close);
-        }
-        if ev(cmd_shift(Key::S)) {
-            self.ed.save(true);
-        } else if ev(cmd(Key::S)) {
-            self.ed.save(false);
-        }
-        if self.ed.file.is_none() {
-            return;
-        }
-        // Zoom works while typing too.
-        if ev(cmd(Key::Equals)) || ev(cmd(Key::Plus)) {
-            self.ed.set_zoom(self.ed.zoom * 1.25, None);
-        }
-        if ev(cmd(Key::Minus)) {
-            self.ed.set_zoom(self.ed.zoom / 1.25, None);
-        }
-        if ev(cmd(Key::Num0)) {
-            self.ed.fit = Some(true);
-        }
-        if ev(cmd(Key::Num1)) {
-            self.ed.set_zoom(1.0, None);
-        }
-        if ev(cmd(Key::E)) {
-            let on = !self.ed.editing;
-            self.ed.set_editing(on);
         }
         let typing = ctx.egui_wants_keyboard_input() || self.ed.text_edit.is_some() || self.ed.note.is_some() || self.ed.field_edit.is_some();
-        if typing {
+        // Commands, through the keymap (Settings > Keyboard shortcuts).
+        let presses: Vec<(Key, Modifiers)> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } => Some((*key, *modifiers)),
+                    _ => None,
+                })
+                .collect()
+        });
+        for (key, m) in presses {
+            let Some(c) = self.ed.keys.command_for(key, m) else { continue };
+            if typing && !c.while_typing() {
+                continue;
+            }
+            // While reading, keys never start changing the document.
+            if !self.ed.editing && c.edits() {
+                continue;
+            }
+            ctx.input_mut(|i| i.consume_key(m, key));
+            self.run(ctx, c);
+        }
+        if self.ed.file.is_none() || typing {
             return;
         }
-        // Reading: undo (for form entries) and paging only.
-        if !self.ed.editing {
-            let ed = &mut self.ed;
-            if ev(cmd_shift(Key::Z)) || ev(cmd(Key::Y)) {
-                ed.redo();
-            } else if ev(cmd(Key::Z)) {
-                ed.undo();
-            }
-            let n = ed.file.as_ref().map_or(0, |f| f.page_count());
+        let ed = &mut self.ed;
+        // Ctrl+Shift+Z redoes too.
+        if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z))) {
+            ed.redo();
+        }
+        if !ed.editing {
             ctx.input(|i| {
                 if i.key_pressed(Key::PageDown) || i.key_pressed(Key::ArrowRight) {
-                    ed.goto = Some((ed.current + 1).min(n.saturating_sub(1)));
+                    ed.next_page();
                 }
                 if i.key_pressed(Key::PageUp) || i.key_pressed(Key::ArrowLeft) {
-                    ed.goto = Some(ed.current.saturating_sub(1));
+                    ed.prev_page();
                 }
                 if i.key_pressed(Key::Home) {
                     ed.goto = Some(0);
                 }
                 if i.key_pressed(Key::End) {
-                    ed.goto = Some(n.saturating_sub(1));
+                    let n = ed.file.as_ref().map_or(0, |f| f.page_count());
+                    ed.goto = Some(ed.row_start(n.saturating_sub(1)));
                 }
             });
             return;
@@ -423,37 +418,6 @@ impl App {
         }
         self.v_was_down = v_down || paste;
         let ed = &mut self.ed;
-        if ev(cmd_shift(Key::Z)) || ev(cmd(Key::Y)) {
-            ed.redo();
-        } else if ev(cmd(Key::Z)) {
-            ed.undo();
-        }
-        if ev(cmd(Key::A)) {
-            ed.select_all();
-        }
-        if ev(cmd(Key::D)) {
-            ed.duplicate_selection();
-        }
-        if ev(cmd(Key::CloseBracket)) {
-            ed.restack(true);
-        }
-        if ev(cmd(Key::OpenBracket)) {
-            ed.restack(false);
-        }
-        if ev(cmd_shift(Key::G))
-            && let crate::editor::Sel::Objects { page, items } = ed.sel.clone()
-            && items.len() == 1
-            && let Some(parts) = ed.ungroup(page, items[0])
-        {
-            ed.sel = crate::editor::Sel::Objects { page, items: parts };
-        }
-        let mods = ctx.input(|i| i.modifiers);
-        if mods.is_none() {
-            let pressed: Option<Tool> = ctx.input(|i| crate::panels_tools().into_iter().find(|t| i.key_pressed(t.key())));
-            if let Some(t) = pressed {
-                panels::choose_tool(ed, t);
-            }
-        }
         ctx.input(|i| {
             if i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace) {
                 ed.delete_selection();
@@ -474,17 +438,17 @@ impl App {
             }
             let n = ed.file.as_ref().map_or(0, |f| f.page_count());
             if ed.sel == crate::editor::Sel::None {
-                if i.key_pressed(Key::PageDown) {
-                    ed.goto = Some((ed.current + 1).min(n.saturating_sub(1)));
+                if i.key_pressed(Key::PageDown) || i.key_pressed(Key::ArrowRight) {
+                    ed.next_page();
                 }
-                if i.key_pressed(Key::PageUp) {
-                    ed.goto = Some(ed.current.saturating_sub(1));
+                if i.key_pressed(Key::PageUp) || i.key_pressed(Key::ArrowLeft) {
+                    ed.prev_page();
                 }
                 if i.key_pressed(Key::Home) {
                     ed.goto = Some(0);
                 }
                 if i.key_pressed(Key::End) {
-                    ed.goto = Some(n.saturating_sub(1));
+                    ed.goto = Some(ed.row_start(n.saturating_sub(1)));
                 }
             } else {
                 let step = if i.modifiers.shift { 10.0 } else { 1.0 };
@@ -502,20 +466,165 @@ impl App {
         });
     }
 
+    /// Can `c` run now?
+    fn enabled(&self, c: Cmd) -> bool {
+        let ed = &self.ed;
+        if c.needs_doc() && ed.file.is_none() {
+            return false;
+        }
+        let objects = matches!(ed.sel, crate::editor::Sel::Objects { .. });
+        match c {
+            Cmd::Undo => ed.can_undo(),
+            Cmd::Redo => ed.can_redo(),
+            Cmd::Duplicate | Cmd::BringFront | Cmd::SendBack => objects,
+            Cmd::Ungroup => matches!(&ed.sel, crate::editor::Sel::Objects { page, items } if items.len() == 1
+                && ed.file.as_ref().is_some_and(|f| f.objects(*page).iter().any(|o| o.index == items[0] && o.kind == crate::pdf::Kind::Group))),
+            Cmd::ApplyRedactions => !ed.redaction_marks().is_empty(),
+            Cmd::CoverPage => ed.layout.two(),
+            _ => true,
+        }
+    }
+
+    /// Run a command, from a menu, a shortcut or the palette.
+    fn run(&mut self, ctx: &egui::Context, c: Cmd) {
+        if !self.enabled(c) {
+            return;
+        }
+        // Commands that change the document switch to editing first.
+        if c.edits() && !self.ed.editing {
+            self.ed.set_editing(true);
+            if !self.ed.editing {
+                return;
+            }
+        }
+        let ed = &mut self.ed;
+        let insert_after = ed.selected_pages().last().copied().unwrap_or(ed.current);
+        match c {
+            Cmd::Open => self.request(ctx, Pending::Open),
+            Cmd::Save => {
+                ed.save(false);
+            }
+            Cmd::SaveAs => {
+                ed.save(true);
+            }
+            Cmd::Close => self.request(ctx, Pending::Close),
+            Cmd::ExportImages => self.export = Some(crate::pageops::ExportDialog::new(&self.ed)),
+            Cmd::Quit => self.request(ctx, Pending::Quit),
+            Cmd::ToggleEdit => {
+                let on = !ed.editing;
+                ed.set_editing(on);
+            }
+            Cmd::Undo => ed.undo(),
+            Cmd::Redo => ed.redo(),
+            Cmd::SelectAll => ed.select_all(),
+            Cmd::Duplicate => ed.duplicate_selection(),
+            Cmd::BringFront => ed.restack(true),
+            Cmd::SendBack => ed.restack(false),
+            Cmd::Ungroup => {
+                if let crate::editor::Sel::Objects { page, items } = ed.sel.clone()
+                    && let Some(parts) = ed.ungroup(page, items[0])
+                {
+                    ed.sel = crate::editor::Sel::Objects { page, items: parts };
+                }
+            }
+            Cmd::ApplyRedactions => {
+                let yes = rfd::MessageDialog::new()
+                    .set_title("Apply redactions")
+                    .set_description("Everything under the marks will be removed from the document for good once you save. Apply now?")
+                    .set_level(rfd::MessageLevel::Warning)
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show()
+                    == rfd::MessageDialogResult::Yes;
+                if yes {
+                    ed.apply_redactions();
+                }
+            }
+            Cmd::ChangeSignature => ed.signature_dialog = true,
+            Cmd::RotateLeft => ed.rotate_pages(-1),
+            Cmd::RotateRight => ed.rotate_pages(1),
+            Cmd::DuplicatePages => ed.duplicate_pages(),
+            Cmd::DeletePages => ed.delete_pages(),
+            Cmd::InsertBlank => ed.insert_blank(insert_after),
+            Cmd::InsertFromFile => ed.insert_from_files(insert_after),
+            Cmd::ExtractPages => ed.extract_pages(),
+            Cmd::Crop => self.crop = Some(crate::pageops::CropDialog::new()),
+            Cmd::Stamp => self.stamp = Some(crate::pageops::StampDialog::new()),
+            Cmd::Flatten => ed.flatten(),
+            Cmd::ZoomIn => ed.set_zoom(ed.zoom * 1.25, None),
+            Cmd::ZoomOut => ed.set_zoom(ed.zoom / 1.25, None),
+            Cmd::FitWidth => ed.fit = Some(true),
+            Cmd::FitPage => ed.fit = Some(false),
+            Cmd::ActualSize => ed.set_zoom(1.0, None),
+            Cmd::Layout(l) => {
+                let cover = ed.cover;
+                ed.set_layout(l, cover);
+                // A page at a time fits the page; a column fits the width.
+                ed.fit = Some(!l.paged());
+            }
+            Cmd::CoverPage => {
+                let (l, cover) = (ed.layout, !ed.cover);
+                ed.set_layout(l, cover);
+            }
+            Cmd::ResetPanels => {
+                if ed.editing {
+                    self.dock = default_dock();
+                } else {
+                    self.view_dock = default_view_dock();
+                }
+            }
+            Cmd::Palette => ed.palette = Some(crate::palette::Palette { focus: true, ..Default::default() }),
+            Cmd::Combine => self.combine = Some(Combine::new(&self.ed)),
+            Cmd::Split => self.split = Some(Split::new(&self.ed)),
+            Cmd::FromImages => {
+                if let Some(files) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff"]).pick_files() {
+                    self.images = Some(crate::pageops::ImagesDialog::new(files));
+                }
+            }
+            Cmd::Compress => self.compress = Some(crate::pageops::CompressDialog::new()),
+            Cmd::Ocr => self.ocr = Some(crate::ocr::OcrDialog::new()),
+            Cmd::Compare => {
+                if let Some(other) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_file()
+                    && let Some(f) = &self.ed.file
+                {
+                    match crate::compare::Compare::new(&f.doc, other) {
+                        Ok(c) => self.compare = Some(c),
+                        Err(e) => self.ed.error = Some(e),
+                    }
+                }
+            }
+            Cmd::Security => self.security = Some(crate::security::SecurityDialog::new(&self.ed)),
+            Cmd::SignDigitally => self.sign = Some(crate::sign::SignDialog::new(&self.ed, None)),
+            Cmd::Settings => self.settings_win.open = true,
+            Cmd::Tool(t) => panels::choose_tool(ed, t),
+        }
+    }
+
+    /// A menu entry for `c`, with its shortcut, greyed out when it cannot run.
+    fn item(&mut self, ui: &mut Ui, c: Cmd) {
+        let b = egui::Button::new(c.name()).shortcut_text(self.ed.keys.text(c));
+        if ui.add_enabled(self.enabled(c), b).clicked() {
+            self.run(ui.ctx(), c);
+            ui.close();
+        }
+    }
+
+    /// A menu entry that shows whether it is on.
+    fn check_item(&mut self, ui: &mut Ui, c: Cmd, on: bool) {
+        let b = egui::Button::selectable(on, c.name()).shortcut_text(self.ed.keys.text(c));
+        if ui.add_enabled(self.enabled(c), b).clicked() {
+            self.run(ui.ctx(), c);
+            ui.close();
+        }
+    }
+
     fn top_bar(&mut self, ui: &mut Ui) {
         let p = pal(ui.ctx());
         let has = self.ed.file.is_some();
+        // As in Grapht and Overlay: the menus start the row; the window's own title bar carries the
+        // icon and the name.
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.add_space(4.0);
-            let (r, _) = ui.allocate_exact_size(vec2(17.0, 17.0), egui::Sense::hover());
-            theme::paint_mark(ui.painter(), r, p.text, p.accent);
-            ui.add_space(-3.0);
-            ui.label(egui::RichText::new("dockit").family(theme::display_family()).size(15.0).color(p.text));
-            ui.add_space(6.0);
             ui.menu_button("File", |ui| {
-                if ui.add(egui::Button::new("Open…").shortcut_text("Ctrl+O")).clicked() {
-                    self.request(ui.ctx(), Pending::Open);
-                }
+                self.item(ui, Cmd::Open);
                 let recent: Vec<PathBuf> = self.ed.recent.iter().filter(|p| p.exists()).cloned().collect();
                 ui.add_enabled_ui(!recent.is_empty(), |ui| {
                     ui.menu_button("Open recent", |ui| {
@@ -528,208 +637,106 @@ impl App {
                     });
                 });
                 ui.separator();
-                if ui.add_enabled(has, egui::Button::new("Save").shortcut_text("Ctrl+S")).clicked() {
-                    self.ed.save(false);
-                }
-                if ui.add_enabled(has, egui::Button::new("Save as…").shortcut_text("Ctrl+Shift+S")).clicked() {
-                    self.ed.save(true);
-                }
-                if ui.add_enabled(has, egui::Button::new("Close").shortcut_text("Ctrl+W")).clicked() {
-                    self.request(ui.ctx(), Pending::Close);
-                }
+                self.item(ui, Cmd::Save);
+                self.item(ui, Cmd::SaveAs);
+                self.item(ui, Cmd::Close);
                 ui.separator();
-                if ui.button("Combine files…").clicked() {
-                    self.combine = Some(Combine::new(&self.ed));
-                }
-                if ui.add_enabled(has, egui::Button::new("Split into files…")).clicked() {
-                    self.split = Some(Split::new(&self.ed));
-                }
-                if ui.add_enabled(has, egui::Button::new("Extract selected pages…")).clicked() {
-                    self.ed.extract_pages();
-                }
-                if ui.button("Create a PDF from images…").clicked()
-                    && let Some(files) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff"]).pick_files()
-                {
-                    self.images = Some(crate::pageops::ImagesDialog::new(files));
-                }
+                self.item(ui, Cmd::ExportImages);
                 ui.separator();
-                if ui.add_enabled(has, egui::Button::new("Export pages as images…")).clicked() {
-                    self.export = Some(crate::pageops::ExportDialog::new(&self.ed));
-                }
-                if ui.add_enabled(has, egui::Button::new("Compress…")).clicked() {
-                    self.compress = Some(crate::pageops::CompressDialog::new());
-                }
-                ui.separator();
-                if ui.add_enabled(has, egui::Button::new("Password and permissions…")).clicked() {
-                    self.security = Some(crate::security::SecurityDialog::new(&self.ed));
-                }
-                if ui.add_enabled(has, egui::Button::new("Sign digitally…")).clicked() {
-                    self.sign = Some(crate::sign::SignDialog::new(&self.ed, None));
-                }
-                ui.separator();
-                if ui.add_enabled(has, egui::Button::new("Compare with another version…")).clicked()
-                    && let Some(other) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_file()
-                    && let Some(f) = &self.ed.file
-                {
-                    match crate::compare::Compare::new(&f.doc, other) {
-                        Ok(c) => self.compare = Some(c),
-                        Err(e) => self.ed.error = Some(e),
-                    }
-                }
-                ui.separator();
-                if crate::setup::running_installed() {
-                    if ui.button("Choose default PDF app…").clicked() {
-                        crate::setup::open_default_apps();
-                    }
-                } else if ui.button("Install Dockit…").clicked() {
-                    self.setup = Some(crate::setup::SetupDialog::new());
-                }
-                ui.separator();
-                if ui.button("Quit").clicked() {
-                    self.request(ui.ctx(), Pending::Quit);
-                }
+                self.item(ui, Cmd::Quit);
             });
             let editing = self.ed.editing;
-            ui.add_enabled_ui(has, |ui| {
-                // Reading shows only File and View; editing adds Edit and Pages.
-                if editing {
-                    ui.menu_button("Edit", |ui| {
-                        if ui.add_enabled(self.ed.can_undo(), egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
-                            self.ed.undo();
-                        }
-                        if ui.add_enabled(self.ed.can_redo(), egui::Button::new("Redo").shortcut_text("Ctrl+Y")).clicked() {
-                            self.ed.redo();
-                        }
-                        ui.separator();
-                        if ui.add(egui::Button::new("Select all on page").shortcut_text("Ctrl+A")).clicked() {
-                            self.ed.select_all();
-                        }
-                        match self.ed.sel.clone() {
-                            crate::editor::Sel::Objects { page, items } => crate::canvas::object_menu(ui, &mut self.ed, page, &items),
-                            crate::editor::Sel::Annot { .. } => {
-                                if ui.button("Delete").clicked() {
-                                    self.ed.delete_selection();
-                                }
-                            }
-                            crate::editor::Sel::None => {}
-                        }
-                        if self.ed.can_paste() && ui.add(egui::Button::new("Paste").shortcut_text("Ctrl+V")).clicked() {
-                            let page = self.ed.current;
-                            self.ed.paste(page);
-                        }
-                        let marks = self.ed.redaction_marks().len();
-                        if marks > 0 {
-                            ui.separator();
-                            if ui.button(format!("Apply {}…", crate::editor::plural(marks, "redaction", "redactions"))).clicked()
-                                && rfd::MessageDialog::new()
-                                    .set_title("Apply redactions")
-                                    .set_description("Everything under the marks will be removed from the document for good once you save. Apply now?")
-                                    .set_level(rfd::MessageLevel::Warning)
-                                    .set_buttons(rfd::MessageButtons::YesNo)
-                                    .show()
-                                    == rfd::MessageDialogResult::Yes
-                            {
-                                self.ed.apply_redactions();
+            // Reading shows File, View, Tools and Settings; editing adds Edit and Pages.
+            if editing && has {
+                ui.menu_button("Edit", |ui| {
+                    self.item(ui, Cmd::Undo);
+                    self.item(ui, Cmd::Redo);
+                    ui.separator();
+                    self.item(ui, Cmd::SelectAll);
+                    match self.ed.sel.clone() {
+                        crate::editor::Sel::Objects { page, items } => crate::canvas::object_menu(ui, &mut self.ed, page, &items),
+                        crate::editor::Sel::Annot { .. } => {
+                            if ui.button("Delete").clicked() {
+                                self.ed.delete_selection();
                             }
                         }
-                        ui.separator();
-                        if ui.button("Change signature…").clicked() {
-                            self.ed.signature_dialog = true;
-                        }
-                    });
-                    ui.menu_button("Pages", |ui| {
-                        let k = self.ed.selected_pages().len();
-                        ui.label(theme::secondary(ui, if k > 1 { format!("{k} selected pages") } else { format!("Page {}", self.ed.current + 1) }));
-                        if ui.button("Rotate left").clicked() {
-                            self.ed.rotate_pages(-1);
-                        }
-                        if ui.button("Rotate right").clicked() {
-                            self.ed.rotate_pages(1);
-                        }
-                        if ui.button("Duplicate").clicked() {
-                            self.ed.duplicate_pages();
-                        }
-                        if ui.button("Delete").clicked() {
-                            self.ed.delete_pages();
-                        }
-                        ui.separator();
-                        let after = self.ed.selected_pages().last().copied().unwrap_or(self.ed.current);
-                        if ui.button("Insert blank page").clicked() {
-                            self.ed.insert_blank(after);
-                        }
-                        if ui.button("Insert pages from a file…").clicked() {
-                            self.ed.insert_from_files(after);
-                        }
-                        ui.separator();
-                        if ui.button("Extract…").clicked() {
-                            self.ed.extract_pages();
-                        }
-                        if ui.button("Split into files…").clicked() {
-                            self.split = Some(Split::new(&self.ed));
-                        }
-                        ui.separator();
-                        if ui.button("Crop or resize…").clicked() {
-                            self.crop = Some(crate::pageops::CropDialog::new());
-                        }
-                        if ui.button("Page numbers, headers and watermark…").clicked() {
-                            self.stamp = Some(crate::pageops::StampDialog::new());
-                        }
-                        if ui.button("Recognize text (OCR)…").clicked() {
-                            self.ocr = Some(crate::ocr::OcrDialog::new());
-                        }
-                        ui.separator();
-                        if ui.button("Flatten comments and form fields").on_hover_text("Draw every comment, mark and form field into the pages so they can no longer be changed").clicked() {
-                            self.ed.flatten();
-                        }
-                    });
-                }
-                ui.menu_button("View", |ui| {
-                    if ui.add(egui::Button::new("Zoom in").shortcut_text("Ctrl++")).clicked() {
-                        self.ed.set_zoom(self.ed.zoom * 1.25, None);
+                        crate::editor::Sel::None => {}
                     }
-                    if ui.add(egui::Button::new("Zoom out").shortcut_text("Ctrl+-")).clicked() {
-                        self.ed.set_zoom(self.ed.zoom / 1.25, None);
+                    if self.ed.can_paste() && ui.add(egui::Button::new("Paste").shortcut_text("Ctrl+V")).clicked() {
+                        let page = self.ed.current;
+                        self.ed.paste(page);
+                    }
+                    if self.enabled(Cmd::ApplyRedactions) {
+                        ui.separator();
+                        self.item(ui, Cmd::ApplyRedactions);
                     }
                     ui.separator();
-                    if ui.add(egui::Button::new("Fit width").shortcut_text("Ctrl+0")).clicked() {
-                        self.ed.fit = Some(true);
-                    }
-                    if ui.button("Fit page").clicked() {
-                        self.ed.fit = Some(false);
-                    }
-                    if ui.add(egui::Button::new("Actual size").shortcut_text("Ctrl+1")).clicked() {
-                        self.ed.set_zoom(1.0, None);
-                    }
-                    ui.separator();
-                    if ui.button("Reset panel layout").clicked() {
-                        if self.ed.editing {
-                            self.dock = default_dock();
-                        } else {
-                            self.view_dock = default_view_dock();
-                        }
-                    }
+                    self.item(ui, Cmd::ChangeSignature);
                 });
+                ui.menu_button("Pages", |ui| {
+                    let k = self.ed.selected_pages().len();
+                    ui.label(theme::secondary(ui, if k > 1 { format!("{k} selected pages") } else { format!("Page {}", self.ed.current + 1) }));
+                    self.item(ui, Cmd::RotateLeft);
+                    self.item(ui, Cmd::RotateRight);
+                    self.item(ui, Cmd::DuplicatePages);
+                    self.item(ui, Cmd::DeletePages);
+                    ui.separator();
+                    self.item(ui, Cmd::InsertBlank);
+                    self.item(ui, Cmd::InsertFromFile);
+                    self.item(ui, Cmd::ExtractPages);
+                    ui.separator();
+                    self.item(ui, Cmd::Crop);
+                    self.item(ui, Cmd::Stamp);
+                    ui.separator();
+                    self.item(ui, Cmd::Flatten);
+                });
+            }
+            ui.menu_button("View", |ui| {
+                self.item(ui, Cmd::ZoomIn);
+                self.item(ui, Cmd::ZoomOut);
+                ui.separator();
+                self.item(ui, Cmd::FitWidth);
+                self.item(ui, Cmd::FitPage);
+                self.item(ui, Cmd::ActualSize);
+                ui.separator();
+                for l in PageLayout::ALL {
+                    let on = self.ed.layout == l;
+                    self.check_item(ui, Cmd::Layout(l), on);
+                }
+                let cover = self.ed.cover;
+                self.check_item(ui, Cmd::CoverPage, cover);
+                ui.separator();
+                self.item(ui, Cmd::Palette);
+                self.item(ui, Cmd::ResetPanels);
             });
+            ui.menu_button("Tools", |ui| {
+                self.item(ui, Cmd::Combine);
+                self.item(ui, Cmd::Split);
+                self.item(ui, Cmd::FromImages);
+                ui.separator();
+                self.item(ui, Cmd::Compress);
+                self.item(ui, Cmd::Ocr);
+                self.item(ui, Cmd::Compare);
+                ui.separator();
+                self.item(ui, Cmd::Security);
+                self.item(ui, Cmd::Tool(Tool::Redact));
+                self.item(ui, Cmd::SignDigitally);
+            });
+            // Settings has its own place in the bar.
+            if ui.button("Settings").on_hover_text(format!("Settings ({})", self.ed.keys.text(Cmd::Settings))).clicked() {
+                self.settings_win.open = true;
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(4.0);
-                ui.scope(|ui| {
-                    ui.set_width(190.0);
-                    let mut a = self.appearance;
-                    if ui.segmented(&mut a, &[(Appearance::System, "System"), (Appearance::Dark, "Dark"), (Appearance::Light, "Light")]) {
-                        self.appearance = a;
-                        theme::set_appearance(ui.ctx(), a);
-                    }
-                });
-                if self.ed.file.is_some() {
-                    ui.add_space(10.0);
+                if has {
                     if self.ed.editing {
-                        if ui.add(egui::Button::new("Done").min_size(vec2(72.0, 0.0))).on_hover_text("Back to reading (Ctrl+E)").clicked() {
+                        if ui.add(egui::Button::new("Done").min_size(vec2(72.0, 0.0))).on_hover_text(format!("Back to reading ({})", self.ed.keys.text(Cmd::ToggleEdit))).clicked() {
                             self.ed.set_editing(false);
                         }
                     } else {
                         let edit = egui::Button::new(theme::semibold("Edit PDF").color(egui::Color32::WHITE)).fill(p.accent).min_size(vec2(84.0, 0.0));
-                        if ui.add(edit).on_hover_text("Edit text, images, pages and more (Ctrl+E)").clicked() {
+                        if ui.add(edit).on_hover_text(format!("Edit text, images, pages and more ({})", self.ed.keys.text(Cmd::ToggleEdit))).clicked() {
                             self.ed.set_editing(true);
                         }
                     }
@@ -737,7 +744,7 @@ impl App {
                 if let Some(f) = &self.ed.file {
                     ui.add_space(8.0);
                     let zoom = format!("{:.0}%", self.ed.zoom * 100.0);
-                    if ui.add(egui::Button::new(theme::secondary(ui, zoom)).frame(false)).on_hover_text("Fit width (Ctrl+0)").clicked() {
+                    if ui.add(egui::Button::new(theme::secondary(ui, zoom)).frame(false)).on_hover_text("Fit width").clicked() {
                         self.ed.fit = Some(true);
                     }
                     ui.label(theme::secondary(ui, format!("Page {} of {}", self.ed.current + 1, f.page_count())));
@@ -805,6 +812,8 @@ impl App {
             recent: self.ed.recent.clone(),
             style: Some(self.ed.style.clone()),
             signature: self.ed.signature.clone(),
+            keys: self.ed.keys.clone(),
+            view: self.ed.view_prefs.clone(),
         };
         eframe::set_value(storage, SETTINGS_KEY, &s);
     }
@@ -987,10 +996,10 @@ impl eframe::App for App {
             }
         }
 
-        if let Some(d) = &mut self.setup
-            && !crate::setup::setup_window(&ctx, d)
-        {
-            self.setup = None;
+        crate::settings::show(&ctx, &mut self.settings_win, &mut self.ed, &mut self.appearance);
+        let enabled_cmds: Vec<Cmd> = crate::commands::sections().into_iter().flat_map(|(_, v)| v).filter(|c| self.enabled(*c)).collect();
+        if let Some(c) = crate::palette::show(&ctx, &mut self.ed, &|c| enabled_cmds.contains(&c)) {
+            self.run(&ctx, c);
         }
         let incoming: Vec<PathBuf> = self.incoming.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
         for path in incoming {

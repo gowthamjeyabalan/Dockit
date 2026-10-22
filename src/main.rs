@@ -6,21 +6,24 @@ mod annots;
 mod app;
 mod arrange;
 mod canvas;
+mod commands;
 mod compare;
 mod content;
 mod dialogs;
 mod editor;
 mod fonts;
 mod incremental;
+mod instance;
 mod mark;
 mod ocr;
 mod pageops;
+mod palette;
 mod panels;
 mod pdf;
 mod recovery;
 mod redact;
 mod security;
-mod setup;
+mod settings;
 mod sign;
 mod theme;
 
@@ -31,30 +34,12 @@ pub fn panels_tools() -> [editor::Tool; 17] {
 }
 
 fn main() -> eframe::Result<()> {
-    let arg = std::env::args().nth(1);
-    match arg.as_deref() {
-        Some("--install") => {
-            if let Err(e) = setup::install(false) {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }
-            return Ok(());
-        }
-        Some("--uninstall") => {
-            let yes = rfd::MessageDialog::new()
-                .set_title("Uninstall Dockit")
-                .set_description("Remove Dockit from this computer? Your settings and documents are kept.")
-                .set_buttons(rfd::MessageButtons::YesNo)
-                .show()
-                == rfd::MessageDialogResult::Yes;
-            if yes {
-                setup::uninstall();
-            }
-            return Ok(());
-        }
-        // A file opened from Explorer goes to the Dockit already running, as a new tab.
-        Some(path) if std::path::Path::new(path).exists() && setup::forward(std::path::Path::new(path)) => return Ok(()),
-        _ => {}
+    // A file opened from Explorer goes to the Dockit already running, as a new tab.
+    if let Some(path) = std::env::args().nth(1).map(std::path::PathBuf::from)
+        && path.exists()
+        && instance::forward(&path)
+    {
+        return Ok(());
     }
     let broken = pdf::init(&pdf::exe_dir()).err();
     let icon = egui::IconData { rgba: mark::icon_rgba(256), width: 256, height: 256 };
