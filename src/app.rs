@@ -104,6 +104,7 @@ pub struct App {
     sign: Option<crate::sign::SignDialog>,
     ocr: Option<crate::ocr::OcrDialog>,
     compare: Option<crate::compare::Compare>,
+    printing: Option<crate::print::PrintJob>,
     autosave: crate::recovery::Autosave,
     settings_win: crate::settings::SettingsWindow,
     /// Files handed over by later launches (double-clicked in Explorer).
@@ -159,6 +160,7 @@ impl App {
             sign: None,
             ocr: None,
             compare: None,
+            printing: None,
             autosave: Default::default(),
             settings_win: Default::default(),
             incoming: broken_none.then(|| crate::instance::listen(cc.egui_ctx.clone())),
@@ -377,6 +379,13 @@ impl App {
         if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z))) {
             ed.redo();
         }
+        // Selected text goes to the clipboard.
+        if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) && !matches!(ed.sel, crate::editor::Sel::Objects { .. })
+            && let Some(t) = ed.selected_text()
+        {
+            ctx.copy_text(t);
+            ed.say("Copied the selected text");
+        }
         if !ed.editing {
             ctx.input(|i| {
                 if i.key_pressed(Key::PageDown) || i.key_pressed(Key::ArrowRight) {
@@ -509,6 +518,18 @@ impl App {
             }
             Cmd::Close => self.request(ctx, Pending::Close),
             Cmd::ExportImages => self.export = Some(crate::pageops::ExportDialog::new(&self.ed)),
+            Cmd::Print => {
+                ed.commit_edits();
+                self.printing = crate::print::begin(&mut self.ed);
+            }
+            Cmd::Find => match &mut ed.find {
+                Some(f) => f.focus = true,
+                None => ed.find = Some(crate::find::Find::open()),
+            },
+            Cmd::DarkPages => {
+                ed.view_prefs.dark_pages = !ed.view_prefs.dark_pages;
+                ed.reset_view_caches();
+            }
             Cmd::Quit => self.request(ctx, Pending::Quit),
             Cmd::ToggleEdit => {
                 let on = !ed.editing;
@@ -642,6 +663,7 @@ impl App {
                 self.item(ui, Cmd::Close);
                 ui.separator();
                 self.item(ui, Cmd::ExportImages);
+                self.item(ui, Cmd::Print);
                 ui.separator();
                 self.item(ui, Cmd::Quit);
             });
@@ -692,6 +714,8 @@ impl App {
                 });
             }
             ui.menu_button("View", |ui| {
+                self.item(ui, Cmd::Find);
+                ui.separator();
                 self.item(ui, Cmd::ZoomIn);
                 self.item(ui, Cmd::ZoomOut);
                 ui.separator();
@@ -705,6 +729,9 @@ impl App {
                 }
                 let cover = self.ed.cover;
                 self.check_item(ui, Cmd::CoverPage, cover);
+                ui.separator();
+                let dark = self.ed.view_prefs.dark_pages;
+                self.check_item(ui, Cmd::DarkPages, dark);
                 ui.separator();
                 self.item(ui, Cmd::Palette);
                 self.item(ui, Cmd::ResetPanels);
@@ -997,6 +1024,18 @@ impl eframe::App for App {
         }
 
         crate::settings::show(&ctx, &mut self.settings_win, &mut self.ed, &mut self.appearance);
+        if self.ed.find.is_some() && !crate::find::find_bar(&ctx, &mut self.ed) {
+            self.ed.find = None;
+        }
+        if let Some(job) = &mut self.printing {
+            if job.step(&mut self.ed) {
+                let msg = format!("Printing page {}", job.progress());
+                self.ed.say(msg);
+                ctx.request_repaint();
+            } else {
+                self.printing = None;
+            }
+        }
         let enabled_cmds: Vec<Cmd> = crate::commands::sections().into_iter().flat_map(|(_, v)| v).filter(|c| self.enabled(*c)).collect();
         if let Some(c) = crate::palette::show(&ctx, &mut self.ed, &|c| enabled_cmds.contains(&c)) {
             self.run(&ctx, c);

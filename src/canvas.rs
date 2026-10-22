@@ -23,6 +23,7 @@ struct PageTex {
     region: [i32; 4],
     epoch: u64,
     rev: u64,
+    dark: bool,
 }
 
 struct Thumb {
@@ -214,6 +215,8 @@ pub struct View {
     flipped_at: f64,
     /// After turning back a page, show its bottom.
     land_bottom: bool,
+    /// Text is being selected on this page (reading).
+    selecting: Option<usize>,
 }
 
 impl Default for View {
@@ -232,6 +235,7 @@ impl Default for View {
             flip: 0.0,
             flipped_at: 0.0,
             land_bottom: false,
+            selecting: None,
         }
     }
 }
@@ -388,6 +392,11 @@ pub fn line_boxes(glyphs: &[Glyph], a: usize, b: usize) -> Vec<[f32; 4]> {
 }
 
 /// The glyph under (or nearest to, within a few points) a user-space position.
+/// The character whose box holds `p` (a little leeway), for starting a text selection.
+fn glyph_at(glyphs: &[Glyph], p: (f32, f32)) -> Option<usize> {
+    glyphs.iter().position(|g| g.rect[2] > g.rect[0] && p.0 >= g.rect[0] - 1.0 && p.0 <= g.rect[2] + 1.0 && p.1 >= g.rect[1] - 1.0 && p.1 <= g.rect[3] + 1.0)
+}
+
 fn glyph_near(glyphs: &[Glyph], p: (f32, f32)) -> Option<usize> {
     let mut best: Option<(f32, usize)> = None;
     for (i, g) in glyphs.iter().enumerate() {
@@ -566,6 +575,9 @@ pub fn canvas_ui(ui: &mut Ui, ed: &mut Editor) {
     ed.view.viewport = avail;
 
     // One page (or spread) at a time: going to a page shows its row.
+    if let (true, Some((pg, _))) = (ed.layout.paged(), ed.reveal) {
+        ed.current = pg;
+    }
     if ed.layout.paged()
         && let Some(g) = ed.goto
     {
@@ -607,7 +619,18 @@ pub fn canvas_ui(ui: &mut Ui, ed: &mut Editor) {
     let wheel = if paged && hover && !ui.input(|i| i.modifiers.command) { ui.input(|i| i.smooth_scroll_delta.y) } else { 0.0 };
 
     let mut sa = egui::ScrollArea::both().id_salt("document").auto_shrink([false, false]);
+    let reveal = ed.reveal.take().and_then(|(pg, r)| {
+        let (rect, g) = (rects.get(pg).filter(|r| r.is_positive())?, f.geom(pg)?);
+        let (vx, vy) = g.to_view(r[0], r[3]);
+        let at = rect.min + vec2(vx, vy) * zoom;
+        // A third of the way down, and across only if it is out of view.
+        let x = if at.x < ed.view.offset.x || at.x > ed.view.offset.x + avail.x - 40.0 { (at.x - avail.x / 3.0).max(0.0) } else { ed.view.offset.x };
+        Some(vec2(x, (at.y - avail.y / 3.0).max(0.0)))
+    });
     if let Some(o) = ed.view.pending_offset.take() {
+        sa = sa.scroll_offset(o);
+    } else if let Some(o) = reveal {
+        ed.goto = None;
         sa = sa.scroll_offset(o);
     } else if let Some(g) = ed.goto.take()
         && let Some(r) = rects.get(g)
@@ -645,9 +668,11 @@ pub fn canvas_ui(ui: &mut Ui, ed: &mut Editor) {
         // ── page pictures ──
         let settled = now() - ed.view.zoom_changed > 0.15;
         let mut budget = 2u32;
+        let dark = ed.view_prefs.dark_pages;
         for &i in &visible {
             let r = screen(i);
-            painter.rect_filled(r, 0.0, Color32::WHITE);
+            let [br, bg, bb] = pdf::DARK_PAGE.to_be_bytes()[1..].try_into().unwrap_or([30, 31, 34]);
+            painter.rect_filled(r, 0.0, if dark { Color32::from_rgb(br, bg, bb) } else { Color32::WHITE });
             painter.rect_stroke(r, 0.0, Stroke::new(1.0, p.hairline), StrokeKind::Outside);
             ensure_page(ed, &ctx, i, r, screen_view, settled, &mut budget);
             if let Some(t) = ed.view.pages.get(&i) {
@@ -672,6 +697,29 @@ pub fn canvas_ui(ui: &mut Ui, ed: &mut Editor) {
         let maps: HashMap<usize, Map> =
             visible.iter().filter_map(|&i| ed.file.as_ref().and_then(|f| f.geom(i)).map(|g| (i, Map { r: screen(i), g, zoom }))).collect();
         let page_at = |pos: Pos2| maps.iter().find(|(_, m)| m.r.contains(pos)).map(|(i, m)| (*i, *m));
+
+        // Matches of the find bar, the current one outlined.
+        if let Some(fd) = &ed.find {
+            for (k, (pg, rs)) in fd.results.iter().enumerate() {
+                let Some(m) = maps.get(pg) else { continue };
+                for r in rs {
+                    let sr = m.rect(*r).expand(1.0);
+                    painter.rect_filled(sr, 2.0, Color32::from_rgba_unmultiplied(255, 200, 0, 90));
+                    if fd.current == Some(k) {
+                        painter.rect_stroke(sr, 2.0, Stroke::new(2.0, Color32::from_rgb(255, 140, 0)), StrokeKind::Outside);
+                    }
+                }
+            }
+        }
+        // Selected text.
+        if let Some((pg, a, b)) = ed.text_sel
+            && let (Some(m), Some(f)) = (maps.get(&pg), ed.file.as_ref())
+        {
+            let glyphs = f.glyphs(pg);
+            for bx in line_boxes(&glyphs, a.min(b), a.max(b)) {
+                painter.rect_filled(m.rect(bx), 0.0, p.accent.gamma_multiply(0.3));
+            }
+        }
         let pointer = resp.hover_pos();
         let mods = ui.input(|i| i.modifiers);
 
@@ -726,15 +774,16 @@ fn ensure_page(ed: &mut Editor, ctx: &egui::Context, i: usize, r: Rect, view: Re
         [a.x.floor().max(0.0) as i32, a.y.floor().max(0.0) as i32, (b.x.ceil() as i32).min(fw), (b.y.ceil() as i32).min(fh)]
     };
     let rev = f.revs[i];
+    let dark = ed.view_prefs.dark_pages;
     let good = ed.view.pages.get(&i).is_some_and(|t| {
         let [a, b, c, d] = t.region;
-        t.epoch == ed.epoch && t.rev == rev && (t.scale - scale).abs() < scale * 0.002 && a <= need[0] && b <= need[1] && c >= need[2] && d >= need[3]
+        t.epoch == ed.epoch && t.rev == rev && t.dark == dark && (t.scale - scale).abs() < scale * 0.002 && a <= need[0] && b <= need[1] && c >= need[2] && d >= need[3]
     });
     if good {
         return;
     }
     // Content changes always redraw at once; zoom changes wait until zooming pauses.
-    let stale_content = ed.view.pages.get(&i).is_none_or(|t| t.epoch != ed.epoch || t.rev != rev);
+    let stale_content = ed.view.pages.get(&i).is_none_or(|t| t.epoch != ed.epoch || t.rev != rev || t.dark != dark);
     if (!settled && !stale_content) || *budget == 0 {
         ctx.request_repaint();
         return;
@@ -743,9 +792,9 @@ fn ensure_page(ed: &mut Editor, ctx: &egui::Context, i: usize, r: Rect, view: Re
     if need[2] <= need[0] || need[3] <= need[1] {
         return;
     }
-    let Some(img) = f.doc.page(i).and_then(|pg| pg.render(scale, need)) else { return };
+    let Some(img) = f.doc.page(i).and_then(|pg| pg.render_with(scale, need, dark)) else { return };
     let tex = ctx.load_texture(format!("page-{i}"), img, egui::TextureOptions::LINEAR);
-    ed.view.pages.insert(i, PageTex { tex, scale, region: need, epoch: ed.epoch, rev });
+    ed.view.pages.insert(i, PageTex { tex, scale, region: need, epoch: ed.epoch, rev, dark });
 }
 
 /// The objects hit at `pos` on a page, smallest first.
@@ -837,18 +886,59 @@ fn interact(
         {
             ctx.set_cursor_icon(CursorIcon::PointingHand);
         }
-        if resp.dragged() {
+        // Over text the pointer selects it; elsewhere a drag moves the page.
+        let over_text = |pos: Pos2| {
+            page_at(pos).and_then(|(page, m)| ed.file.as_ref().and_then(|f| glyph_at(&f.glyphs(page), m.user(pos))).map(|g| (page, g)))
+        };
+        if let (Some(pos), None) = (pointer, &ed.view.drag)
+            && on_field(pos).is_none()
+            && over_text(pos).is_some()
+        {
+            ctx.set_cursor_icon(CursorIcon::Text);
+        }
+        if resp.drag_started()
+            && let Some(start) = press
+            && let Some((page, g)) = over_text(start)
+        {
+            ed.view.selecting = Some(page);
+            ed.text_sel = Some((page, g, g));
+        }
+        if let Some(page) = ed.view.selecting {
+            if resp.dragged()
+                && let (Some(pos), Some(m), Some(f)) = (pointer.or(resp.interact_pointer_pos()), maps.get(&page), ed.file.as_ref())
+                && let Some(b) = glyph_near(&f.glyphs(page), m.user(pos))
+                && let Some(sel) = &mut ed.text_sel
+            {
+                sel.2 = b;
+            }
+            ctx.set_cursor_icon(CursorIcon::Text);
+            if resp.drag_stopped() {
+                ed.view.selecting = None;
+            }
+        } else if resp.dragged() {
             ed.view.pending_offset = Some((ed.view.offset - resp.drag_delta()).max(Vec2::ZERO));
             ctx.set_cursor_icon(CursorIcon::Grabbing);
         } else if resp.clicked()
             && let Some(pos) = resp.interact_pointer_pos()
         {
+            ed.text_sel = None;
             if let Some(at) = on_field(pos) {
                 click(ed, Some(at), pos, mods);
             } else {
                 ed.view.field_menu = None;
                 ed.commit_edits();
             }
+        }
+        // Right-click on selected text offers to copy it.
+        if ed.text_sel.is_some() {
+            resp.context_menu(|ui| {
+                if ui.add(egui::Button::new("Copy").shortcut_text("Ctrl+C")).clicked() {
+                    if let Some(t) = ed.selected_text() {
+                        ui.ctx().copy_text(t);
+                    }
+                    ui.close();
+                }
+            });
         }
         return;
     }

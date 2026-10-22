@@ -242,11 +242,13 @@ pub struct ViewPrefs {
     pub open_editing: bool,
     /// Layouts of recent documents.
     pub remembered: Vec<(PathBuf, PageLayout, bool)>,
+    /// Pages drawn light on dark, for reading at night.
+    pub dark_pages: bool,
 }
 
 impl Default for ViewPrefs {
     fn default() -> Self {
-        ViewPrefs { layout: PageLayout::Continuous, cover: true, remember: true, open_editing: false, remembered: Vec::new() }
+        ViewPrefs { layout: PageLayout::Continuous, cover: true, remember: true, open_editing: false, remembered: Vec::new(), dark_pages: false }
     }
 }
 
@@ -616,6 +618,11 @@ pub struct Editor {
     pub layout: PageLayout,
     /// With two pages side by side, the first page stands alone.
     pub cover: bool,
+    pub find: Option<crate::find::Find>,
+    /// Selected text while reading: page and first and last character.
+    pub text_sel: Option<(usize, usize, usize)>,
+    /// Scroll so this area of a page (l, b, r, t) is in view.
+    pub reveal: Option<(usize, [f32; 4])>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -658,6 +665,9 @@ impl Default for Editor {
             view_prefs: ViewPrefs::default(),
             layout: PageLayout::Continuous,
             cover: true,
+            find: None,
+            text_sel: None,
+            reveal: None,
         }
     }
 }
@@ -678,6 +688,7 @@ impl Editor {
 
     fn clear_transient(&mut self) {
         self.sel = Sel::None;
+        self.text_sel = None;
         self.text_edit = None;
         self.note = None;
         self.field_edit = None;
@@ -801,6 +812,13 @@ impl Editor {
             r.insert(0, (p, layout, cover));
             r.truncate(200);
         }
+    }
+
+    /// The selected text, if any.
+    pub fn selected_text(&self) -> Option<String> {
+        let (page, a, b) = self.text_sel?;
+        let t = self.file.as_ref()?.doc.page(page)?.text_range(a.min(b), a.max(b));
+        (!t.is_empty()).then_some(t)
     }
 
     /// The first page of the row (page or spread) that page `i` is in.

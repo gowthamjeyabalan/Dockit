@@ -7,7 +7,7 @@
 
 use pdfium_render::prelude::{
     FPDF_DOCUMENT, FPDF_FILEACCESS, FPDF_FILEWRITE, FPDF_FONT, FPDF_FORMFILLINFO, FPDF_FORMHANDLE, FPDF_PAGE, FPDF_PAGEOBJECT, FS_MATRIX, FS_POINTF,
-    FS_QUADPOINTSF, FS_RECTF, FS_SIZEF, Pdfium, PdfiumLibraryBindings,
+    FPDF_COLORSCHEME, FS_QUADPOINTSF, IFSDK_PAUSE, FS_RECTF, FS_SIZEF, Pdfium, PdfiumLibraryBindings,
 };
 use std::cell::{Cell, RefCell};
 use std::ffi::{c_int, c_uchar, c_ulong, c_void};
@@ -65,6 +65,9 @@ pub const FIELD_FLAG_READONLY: i32 = 1;
 pub const FIELD_FLAG_MULTILINE: i32 = 1 << 12;
 
 const FLAG_ANNOT: c_int = 0x01;
+const FLAG_PRINTING: c_int = 0x800;
+/// The page background in dark reading, ARGB.
+pub const DARK_PAGE: u32 = 0xFF1E1F22;
 const FLAG_REVERSE_BYTE_ORDER: c_int = 0x10;
 const BITMAP_BGRA: c_int = 4;
 const BITMAP_BGRX: c_int = 3;
@@ -667,6 +670,12 @@ impl<'d> Page<'d> {
 
     /// Render the pixel region `[x0, y0, x1, y1]` of the page drawn at `scale` pixels per point.
     pub fn render(&self, scale: f32, region: [i32; 4]) -> Option<egui::ColorImage> {
+        self.render_with(scale, region, false)
+    }
+
+    /// Like `render`; `dark` draws the page light-on-dark for reading at night: text and lines in
+    /// light colours, filled areas in the background colour, pictures as they are.
+    pub fn render_with(&self, scale: f32, region: [i32; 4], dark: bool) -> Option<egui::ColorImage> {
         let l = lib();
         let (w, h) = unsafe { (l.FPDF_GetPageWidthF(self.h), l.FPDF_GetPageHeightF(self.h)) };
         let (fw, fh) = ((w * scale).round().max(1.0) as c_int, (h * scale).round().max(1.0) as c_int);
@@ -677,9 +686,26 @@ impl<'d> Page<'d> {
             if bmp.is_null() {
                 return None;
             }
-            l.FPDFBitmap_FillRect(bmp, 0, 0, bw, bh, 0xFFFF_FFFF);
             let flags = FLAG_ANNOT | FLAG_REVERSE_BYTE_ORDER;
-            l.FPDF_RenderPageBitmap(bmp, self.h, -x0, -y0, fw, fh, 0, flags);
+            if dark {
+                // FillRect ignores the byte order flag, so its colour is given with red and blue swapped.
+                let [_, r, g, b] = DARK_PAGE.to_be_bytes();
+                l.FPDFBitmap_FillRect(bmp, 0, 0, bw, bh, u32::from_be_bytes([255, b, g, r]) as _);
+                let scheme = FPDF_COLORSCHEME { path_fill_color: DARK_PAGE as _, path_stroke_color: 0xFFB4B6BC, text_fill_color: 0xFFE2E3E6, text_stroke_color: 0xFFE2E3E6 };
+                // A progressive render that never pauses: it runs to the end in one go.
+                unsafe extern "C" fn never(_: *mut IFSDK_PAUSE) -> pdfium_render::prelude::FPDF_BOOL {
+                    0
+                }
+                let mut pause = IFSDK_PAUSE { version: 1, NeedToPauseNow: Some(never), user: null_mut() };
+                let mut status = l.FPDF_RenderPageBitmapWithColorScheme_Start(bmp, self.h, -x0, -y0, fw, fh, 0, flags, &scheme, &mut pause);
+                while status == 1 {
+                    status = l.FPDF_RenderPage_Continue(self.h, &mut pause);
+                }
+                l.FPDF_RenderPage_Close(self.h);
+            } else {
+                l.FPDFBitmap_FillRect(bmp, 0, 0, bw, bh, 0xFFFF_FFFF);
+                l.FPDF_RenderPageBitmap(bmp, self.h, -x0, -y0, fw, fh, 0, flags);
+            }
             if !self.doc.form.is_null() {
                 l.FPDF_FFLDraw(self.doc.form, bmp, self.h, -x0, -y0, fw, fh, 0, flags);
             }
@@ -692,6 +718,86 @@ impl<'d> Page<'d> {
             }
             l.FPDFBitmap_Destroy(bmp);
             Some(egui::ColorImage::from_rgba_unmultiplied([bw as usize, bh as usize], &px))
+        }
+    }
+
+    /// The page drawn for a printer: `w` × `h` pixels, turned a quarter turn clockwise `rotate`
+    /// times, as top-down BGRA rows (what a DIB wants).
+    pub fn render_print(&self, w: i32, h: i32, rotate: i32) -> Option<Vec<u8>> {
+        let l = lib();
+        unsafe {
+            let bmp = l.FPDFBitmap_CreateEx(w, h, BITMAP_BGRA, null_mut(), 0);
+            if bmp.is_null() {
+                return None;
+            }
+            l.FPDFBitmap_FillRect(bmp, 0, 0, w, h, 0xFFFF_FFFF);
+            let flags = FLAG_ANNOT | FLAG_PRINTING;
+            l.FPDF_RenderPageBitmap(bmp, self.h, 0, 0, w, h, rotate, flags);
+            if !self.doc.form.is_null() {
+                l.FPDF_FFLDraw(self.doc.form, bmp, self.h, 0, 0, w, h, rotate, flags);
+            }
+            let stride = l.FPDFBitmap_GetStride(bmp) as usize;
+            let buf = l.FPDFBitmap_GetBuffer(bmp) as *const u8;
+            let row = w as usize * 4;
+            let mut px = Vec::with_capacity(row * h as usize);
+            for y in 0..h as usize {
+                px.extend_from_slice(std::slice::from_raw_parts(buf.add(y * stride), row));
+            }
+            l.FPDFBitmap_Destroy(bmp);
+            Some(px)
+        }
+    }
+
+    /// Every place `query` appears on the page, each as the rects (l, b, r, t) it covers.
+    pub fn find(&self, query: &str, match_case: bool, whole_word: bool) -> Vec<Vec<[f32; 4]>> {
+        let l = lib();
+        let mut out = Vec::new();
+        if query.is_empty() {
+            return out;
+        }
+        unsafe {
+            let tp = l.FPDFText_LoadPage(self.h);
+            if tp.is_null() {
+                return out;
+            }
+            let q = wide(query);
+            let flags = (if match_case { 1 } else { 0 }) | (if whole_word { 2 } else { 0 });
+            let sh = l.FPDFText_FindStart(tp, q.as_ptr(), flags, 0);
+            if !sh.is_null() {
+                while l.FPDFText_FindNext(sh) != 0 {
+                    let (start, count) = (l.FPDFText_GetSchResultIndex(sh), l.FPDFText_GetSchCount(sh));
+                    let n = l.FPDFText_CountRects(tp, start, count);
+                    let rects = (0..n.max(0))
+                        .filter_map(|k| {
+                            let (mut a, mut t, mut r, mut b) = (0.0, 0.0, 0.0, 0.0);
+                            (l.FPDFText_GetRect(tp, k, &mut a, &mut t, &mut r, &mut b) != 0).then_some([a as f32, b as f32, r as f32, t as f32])
+                        })
+                        .collect::<Vec<_>>();
+                    if !rects.is_empty() {
+                        out.push(rects);
+                    }
+                }
+                l.FPDFText_FindClose(sh);
+            }
+            l.FPDFText_ClosePage(tp);
+        }
+        out
+    }
+
+    /// The text of characters `a..=b` of the text layer (as numbered by `glyphs`).
+    pub fn text_range(&self, a: usize, b: usize) -> String {
+        let l = lib();
+        unsafe {
+            let tp = l.FPDFText_LoadPage(self.h);
+            if tp.is_null() {
+                return String::new();
+            }
+            let count = (b.max(a) - a.min(b) + 1) as c_int;
+            let mut buf = vec![0u16; count as usize + 1];
+            let got = l.FPDFText_GetText(tp, a.min(b) as c_int, count, buf.as_mut_ptr()).max(1) as usize;
+            l.FPDFText_ClosePage(tp);
+            // Line breaks come as \r\n.
+            String::from_utf16_lossy(&buf[..got - 1]).replace("\r\n", "\n")
         }
     }
 

@@ -49,6 +49,7 @@ pub enum Cmd {
     SaveAs,
     Close,
     ExportImages,
+    Print,
     Quit,
     // Edit
     ToggleEdit,
@@ -82,6 +83,8 @@ pub enum Cmd {
     CoverPage,
     ResetPanels,
     Palette,
+    Find,
+    DarkPages,
     // Tools
     Combine,
     Split,
@@ -104,6 +107,7 @@ impl Cmd {
             Cmd::SaveAs => "Save as…".into(),
             Cmd::Close => "Close".into(),
             Cmd::ExportImages => "Export pages as images…".into(),
+            Cmd::Print => "Print…".into(),
             Cmd::Quit => "Quit".into(),
             Cmd::ToggleEdit => "Edit PDF or finish editing".into(),
             Cmd::Undo => "Undo".into(),
@@ -134,6 +138,8 @@ impl Cmd {
             Cmd::CoverPage => "Show the cover page alone".into(),
             Cmd::ResetPanels => "Reset panel layout".into(),
             Cmd::Palette => "Command palette".into(),
+            Cmd::Find => "Find…".into(),
+            Cmd::DarkPages => "Dark pages".into(),
             Cmd::Combine => "Combine files…".into(),
             Cmd::Split => "Split into files…".into(),
             Cmd::FromImages => "Create a PDF from images…".into(),
@@ -153,6 +159,9 @@ impl Cmd {
             Cmd::Open => "file load",
             Cmd::Save | Cmd::SaveAs => "file write",
             Cmd::ExportImages => "png jpg jpeg picture",
+            Cmd::Print => "printer paper",
+            Cmd::Find => "search text look for",
+            Cmd::DarkPages => "night reading invert dark mode",
             Cmd::ToggleEdit => "edit done reading",
             Cmd::Combine => "merge join",
             Cmd::Split => "separate",
@@ -204,7 +213,7 @@ impl Cmd {
     pub fn while_typing(self) -> bool {
         matches!(
             self,
-            Cmd::Open | Cmd::Save | Cmd::SaveAs | Cmd::Close | Cmd::Quit | Cmd::ZoomIn | Cmd::ZoomOut | Cmd::FitWidth | Cmd::FitPage | Cmd::ActualSize | Cmd::Palette | Cmd::Settings
+            Cmd::Open | Cmd::Save | Cmd::SaveAs | Cmd::Close | Cmd::Quit | Cmd::ZoomIn | Cmd::ZoomOut | Cmd::FitWidth | Cmd::FitPage | Cmd::ActualSize | Cmd::Palette | Cmd::Settings | Cmd::Find | Cmd::Print
         )
     }
 }
@@ -212,7 +221,7 @@ impl Cmd {
 /// Every command with a shortcut, in the order Settings lists them, by menu.
 pub fn sections() -> Vec<(&'static str, Vec<Cmd>)> {
     vec![
-        ("File", vec![Cmd::Open, Cmd::Save, Cmd::SaveAs, Cmd::Close, Cmd::ExportImages, Cmd::Quit]),
+        ("File", vec![Cmd::Open, Cmd::Save, Cmd::SaveAs, Cmd::Close, Cmd::ExportImages, Cmd::Print, Cmd::Quit]),
         ("Edit", vec![Cmd::ToggleEdit, Cmd::Undo, Cmd::Redo, Cmd::SelectAll, Cmd::Duplicate, Cmd::BringFront, Cmd::SendBack, Cmd::Ungroup, Cmd::ApplyRedactions]),
         (
             "Pages",
@@ -221,6 +230,7 @@ pub fn sections() -> Vec<(&'static str, Vec<Cmd>)> {
         (
             "View",
             vec![
+                Cmd::Find,
                 Cmd::ZoomIn,
                 Cmd::ZoomOut,
                 Cmd::FitWidth,
@@ -231,6 +241,7 @@ pub fn sections() -> Vec<(&'static str, Vec<Cmd>)> {
                 Cmd::Layout(PageLayout::Two),
                 Cmd::Layout(PageLayout::TwoContinuous),
                 Cmd::CoverPage,
+                Cmd::DarkPages,
                 Cmd::Palette,
             ],
         ),
@@ -314,6 +325,8 @@ pub fn default_combo(c: Cmd) -> Option<Combo> {
         Cmd::Layout(PageLayout::Two) => ctrl_shift(Num3),
         Cmd::Layout(PageLayout::TwoContinuous) => ctrl_shift(Num4),
         Cmd::Palette => ctrl(K),
+        Cmd::Find => ctrl(F),
+        Cmd::Print => ctrl(P),
         Cmd::Settings => ctrl(Comma),
         Cmd::Tool(t) => Some(Combo::new(t.key(), false, false)),
         _ => None,
