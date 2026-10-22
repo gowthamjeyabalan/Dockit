@@ -118,6 +118,21 @@ impl Autosave {
         self.written = keep;
     }
 
+    /// Write a copy of every document with unsaved work now, whatever the timer says (after
+    /// something went wrong).
+    pub fn write_now<'a>(&mut self, editors: impl Iterator<Item = &'a Editor>) {
+        self.written.clear();
+        for ed in editors {
+            if let Some(f) = &ed.file
+                && ed.needs_save()
+            {
+                write(f);
+                self.written.push((f.uid, f.state()));
+            }
+        }
+        self.last = Instant::now();
+    }
+
     /// Dockit is closing normally: no copies are needed.
     pub fn clear(&mut self) {
         let pid = std::process::id();

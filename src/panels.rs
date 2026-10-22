@@ -199,7 +199,7 @@ fn tool_options(ui: &mut Ui, ed: &mut Editor) {
         }
         Tool::Redact => {
             theme::heading(ui, "REDACTION");
-            let marks = ed.redaction_marks().len();
+            let marks = ed.redaction_marks_seen();
             ui.label(theme::secondary(
                 ui,
                 if marks == 0 { "No areas marked yet.".to_string() } else { format!("{} marked. Review them, then apply.", plural(marks, "area", "areas")) },
@@ -936,8 +936,21 @@ fn settled_number(ui: &mut Ui, id: egui::Id, current: f32, speed: f64, range: st
 
 // ── Comments ──
 
+/// While a long document's annotations are still being read: say so and keep going next frame.
+fn still_reading(ui: &mut Ui, f: &crate::editor::File, what: &str) -> bool {
+    let left = f.preload_annots(40);
+    if left > 0 {
+        ui.label(theme::secondary(ui, format!("Reading {what}… {} to go", plural(left, "page", "pages"))));
+        ui.ctx().request_repaint();
+    }
+    left > 0
+}
+
 pub fn comments_ui(ui: &mut Ui, ed: &mut Editor) {
     let Some(f) = &ed.file else { return no_document(ui) };
+    if still_reading(ui, f, "comments") {
+        return;
+    }
     let p = pal(ui.ctx());
     let n = f.page_count();
     // Top-level comments and marks, each with its replies and latest review state.
@@ -1096,6 +1109,9 @@ enum CommentAction {
 
 pub fn form_ui(ui: &mut Ui, ed: &mut Editor) {
     let Some(f) = &ed.file else { return no_document(ui) };
+    if f.doc.has_form() && still_reading(ui, f, "form fields") {
+        return;
+    }
     if !f.doc.has_form() {
         ui.label(theme::secondary(ui, "This document has no form fields. Dockit can look for the blanks, boxes and lines where they belong, or you can draw them with the Form field tool (F)."));
         if ui.button("Find form fields").clicked() {

@@ -476,7 +476,7 @@ pub fn attachments_window(ctx: &egui::Context, ed: &mut Editor, d: &mut Attachme
         }
     }
     if let Some(k) = delete {
-        ed.apply_doc(|f| f.doc.delete_attachment(k));
+        ed.apply_doc_on(&[], |f| f.doc.delete_attachment(k));
         ed.say("Attachment removed");
     }
     if add && let Some(files) = rfd::FileDialog::new().pick_files() {
@@ -484,7 +484,7 @@ pub fn attachments_window(ctx: &egui::Context, ed: &mut Editor, d: &mut Attachme
         for path in files {
             let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
             match std::fs::read(&path) {
-                Ok(bytes) if ed.apply_doc(|f| f.doc.add_attachment(&name, &bytes)) == Some(true) => n += 1,
+                Ok(bytes) if ed.apply_doc_on(&[], |f| f.doc.add_attachment(&name, &bytes)) == Some(true) => n += 1,
                 _ => d.error = Some(format!("{} could not be attached.", path.display())),
             }
         }

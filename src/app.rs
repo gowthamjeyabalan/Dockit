@@ -112,6 +112,8 @@ pub struct App {
     attachments: Option<crate::docinfo::AttachmentsDialog>,
     batch: Option<crate::batch::BatchDialog>,
     reader: Option<crate::speech::Reader>,
+    /// Recent caught panics, to notice one that keeps happening.
+    panics: Vec<std::time::Instant>,
     access: Option<crate::accessibility::CheckDialog>,
     alt: Option<crate::accessibility::AltDialog>,
     standard: Option<crate::standards::StandardDialog>,
@@ -180,6 +182,7 @@ impl App {
             attachments: None,
             batch: None,
             reader: None,
+            panics: Vec::new(),
             access: None,
             alt: None,
             standard: None,
@@ -524,7 +527,7 @@ impl App {
             Cmd::Duplicate | Cmd::BringFront | Cmd::SendBack => objects,
             Cmd::Ungroup => matches!(&ed.sel, crate::editor::Sel::Objects { page, items } if items.len() == 1
                 && ed.file.as_ref().is_some_and(|f| f.objects(*page).iter().any(|o| o.index == items[0] && o.kind == crate::pdf::Kind::Group))),
-            Cmd::ApplyRedactions => !ed.redaction_marks().is_empty(),
+            Cmd::ApplyRedactions => ed.redaction_marks_seen() > 0,
             Cmd::CoverPage => ed.layout.two(),
             _ => true,
         }
@@ -983,7 +986,68 @@ impl TabViewer for Viewer<'_> {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        // A bug in Dockit's own code is caught here, so the window stays open and the work in it
+        // is kept (the details go to crash.log, see main.rs).
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.frame_ui(ui, frame)));
+        if run.is_err() {
+            self.recover_from_panic();
+        }
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.save_settings(storage);
+    }
+}
+
+impl App {
+    /// After a caught panic: keep a copy of every open document, tell the user, and if it keeps
+    /// happening, close what was open so the same thing does not run again.
+    fn recover_from_panic(&mut self) {
+        self.autosave.write_now(std::iter::once(&self.ed).chain(self.tabs.iter()));
+        let now = std::time::Instant::now();
+        self.panics.retain(|t| now.duration_since(*t).as_secs() < 5);
+        self.panics.push(now);
+        if self.panics.len() >= 3 {
+            self.crop = None;
+            self.stamp = None;
+            self.compress = None;
+            self.security = None;
+            self.sign = None;
+            self.ocr = None;
+            self.compare = None;
+            self.printing = None;
+            self.bates = None;
+            self.find_redact = None;
+            self.properties = None;
+            self.sanitize = None;
+            self.attachments = None;
+            self.batch = None;
+            self.access = None;
+            self.alt = None;
+            self.standard = None;
+            self.preflight = None;
+            self.marks = None;
+            self.export = None;
+            self.images = None;
+            self.combine = None;
+            self.split = None;
+            self.pad = None;
+            self.ed.reset_after_failure();
+            self.panics.clear();
+        }
+        self.ed.error = Some(format!(
+            "Something went wrong in Dockit. It kept running, and a copy of your work was saved in case. If it happens again, the details are in {}.",
+            crate::recovery::dir().parent().map(|d| d.join("crash.log").display().to_string()).unwrap_or_default()
+        ));
+    }
+
+    fn frame_ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        // Debug builds can be made to fail once, to try the recovery above.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("DOCKIT_PANIC_ONCE").is_some() && self.panics.is_empty() && self.ed.error.is_none() {
+            panic!("a test failure (DOCKIT_PANIC_ONCE)");
+        }
         let ctx = ui.ctx().clone();
         let p = pal(&ctx);
         if let Some(msg) = &self.broken {
@@ -1185,9 +1249,13 @@ impl eframe::App for App {
                 self.printing = None;
             }
         }
-        let enabled_cmds: Vec<Cmd> = crate::commands::sections().into_iter().flat_map(|(_, v)| v).filter(|c| self.enabled(*c)).collect();
-        if let Some(c) = crate::palette::show(&ctx, &mut self.ed, &|c| enabled_cmds.contains(&c)) {
-            self.run(&ctx, c);
+        // Which commands can run is worked out only while the palette is open (it reads every
+        // page's annotations for some of them).
+        if self.ed.palette.is_some() {
+            let enabled_cmds: Vec<Cmd> = crate::commands::sections().into_iter().flat_map(|(_, v)| v).filter(|c| self.enabled(*c)).collect();
+            if let Some(c) = crate::palette::show(&ctx, &mut self.ed, &|c| enabled_cmds.contains(&c)) {
+                self.run(&ctx, c);
+            }
         }
         let incoming: Vec<PathBuf> = self.incoming.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
         for path in incoming {
@@ -1266,9 +1334,6 @@ impl eframe::App for App {
         }
     }
 
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        self.save_settings(storage);
-    }
 }
 
 /// Is the V key physically down? Used to catch Ctrl+V when the system clipboard holds no text.

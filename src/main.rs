@@ -42,7 +42,24 @@ pub fn panels_tools() -> [editor::Tool; 17] {
     [Select, Text, Image, Rect, Ellipse, Line, Highlight, Note, Ink, Stamp, Arrow, TextBox, Callout, Measure, Field, Redact, Sign]
 }
 
+/// Write what went wrong to %LOCALAPPDATA%\Dockit\crash.log (the app catches the panic and goes on).
+fn log_panics() {
+    std::panic::set_hook(Box::new(|info| {
+        let dir = recovery::dir();
+        let Some(base) = dir.parent() else { return };
+        let _ = std::fs::create_dir_all(base);
+        let when = annots::show_date(&annots::pdf_date());
+        let trace = std::backtrace::Backtrace::force_capture();
+        let line = format!("--- {when}, Dockit {}\n{info}\n{trace}\n", env!("CARGO_PKG_VERSION"));
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(base.join("crash.log")) {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }));
+}
+
 fn main() -> eframe::Result<()> {
+    log_panics();
     // A file opened from Explorer goes to the Dockit already running, as a new tab.
     if let Some(path) = std::env::args().nth(1).map(std::path::PathBuf::from)
         && path.exists()

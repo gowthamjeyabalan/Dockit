@@ -71,6 +71,7 @@ pub const DARK_PAGE: u32 = 0xFF1E1F22;
 const FLAG_REVERSE_BYTE_ORDER: c_int = 0x10;
 const BITMAP_BGRA: c_int = 4;
 const BITMAP_BGRX: c_int = 3;
+const SAVE_INCREMENTAL: c_ulong = 1;
 const SAVE_NO_INCREMENTAL: c_ulong = 2;
 const SAVE_REMOVE_SECURITY: c_ulong = 3;
 const FONT_TRUETYPE: c_int = 2;
@@ -133,8 +134,9 @@ pub struct Doc {
     h: FPDF_DOCUMENT,
     form: FPDF_FORMHANDLE,
     _form_info: Box<FPDF_FORMFILLINFO>,
-    /// PDFium reads from this buffer for as long as the document is open.
-    _bytes: Vec<u8>,
+    /// PDFium reads from this buffer for as long as the document is open (shared with the undo
+    /// history, so a file is held in memory once).
+    _bytes: std::rc::Rc<Vec<u8>>,
     /// Fonts loaded into this document, with their file data kept alive alongside.
     fonts: RefCell<Vec<(String, FPDF_FONT, Vec<u8>)>>,
 }
@@ -185,6 +187,11 @@ unsafe extern "C" fn get_block(param: *mut c_void, pos: c_ulong, buf: *mut c_uch
 
 impl Doc {
     pub fn open(bytes: Vec<u8>, password: Option<&str>) -> Result<Doc, OpenError> {
+        Self::open_shared(std::rc::Rc::new(bytes), password)
+    }
+
+    /// Open a document from bytes that something else (the undo history) holds too.
+    pub fn open_shared(bytes: std::rc::Rc<Vec<u8>>, password: Option<&str>) -> Result<Doc, OpenError> {
         let h = unsafe { lib().FPDF_LoadMemDocument64(&bytes, password) };
         if h.is_null() {
             let code = unsafe { lib().FPDF_GetLastError() };
@@ -199,10 +206,10 @@ impl Doc {
     }
 
     pub fn new_empty() -> Doc {
-        Self::wrap(unsafe { lib().FPDF_CreateNewDocument() }, Vec::new())
+        Self::wrap(unsafe { lib().FPDF_CreateNewDocument() }, std::rc::Rc::new(Vec::new()))
     }
 
-    fn wrap(h: FPDF_DOCUMENT, bytes: Vec<u8>) -> Doc {
+    fn wrap(h: FPDF_DOCUMENT, bytes: std::rc::Rc<Vec<u8>>) -> Doc {
         // The form-fill module loads widgets so fields render and can be filled. No callbacks are needed.
         let mut info = Box::new(FPDF_FORMFILLINFO {
             version: 2,
@@ -289,15 +296,30 @@ impl Doc {
         if ok != 0 { Ok(w.out) } else { Err("PDFium could not write the document.".into()) }
     }
 
-    /// The document without its security handler (for rewriting page content directly).
-    pub fn save_plain(&self) -> Result<Vec<u8>, String> {
+    /// The file as it was opened with only the changes since appended (an incremental update):
+    /// quick, and it shares its beginning with the bytes it came from.
+    pub fn save_incremental(&self) -> Result<Vec<u8>, String> {
+        self.save_with(SAVE_INCREMENTAL).or_else(|_| self.save())
+    }
+
+    fn save_with(&self, flags: c_ulong) -> Result<Vec<u8>, String> {
         if !self.form.is_null() {
             unsafe { lib().FORM_ForceToKillFocus(self.form) };
         }
         let mut w = Writer { fw: FPDF_FILEWRITE { version: 1, WriteBlock: Some(write_block) }, out: Vec::new() };
-        let flags = if self.encrypted() { SAVE_REMOVE_SECURITY } else { SAVE_NO_INCREMENTAL };
         let ok = unsafe { lib().FPDF_SaveAsCopy(self.h, &mut w.fw, flags) };
         if ok != 0 { Ok(w.out) } else { Err("PDFium could not write the document.".into()) }
+    }
+
+    /// The document without its security handler (for rewriting page content directly), as an
+    /// incremental update when it is not encrypted.
+    pub fn save_plain(&self) -> Result<Vec<u8>, String> {
+        if self.encrypted() { self.save_with(SAVE_REMOVE_SECURITY) } else { self.save_incremental() }
+    }
+
+    /// Like `save_plain`, but always written afresh (for files whose structure needed repair).
+    pub fn save_plain_full(&self) -> Result<Vec<u8>, String> {
+        self.save_with(if self.encrypted() { SAVE_REMOVE_SECURITY } else { SAVE_NO_INCREMENTAL })
     }
 
     /// A document information entry ("Title", "Author", "Subject", "Keywords", "Creator",

@@ -293,3 +293,24 @@ mod tests {
         assert!(doc.page(0).unwrap().page_text().contains("ABC0011"), "numbering carries on after 4 pages");
     }
 }
+
+#[cfg(test)]
+mod big {
+    use crate::pdf::Doc;
+    use std::path::Path;
+
+    /// Makes target/devtools/out/big.pdf: the 45-page sample twenty times over (run with --ignored).
+    #[test]
+    #[ignore]
+    fn make_big_document() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"));
+        crate::pdf::init(base.join("target/debug").as_path()).unwrap();
+        let src = Doc::open(std::fs::read(base.join("target/devtools/out/lua2.pdf")).unwrap(), None).unwrap();
+        let doc = Doc::new_empty();
+        for _ in 0..20 {
+            assert!(doc.import(&src, None, doc.page_count()));
+        }
+        std::fs::write(base.join("target/devtools/out/big.pdf"), doc.save().unwrap()).unwrap();
+        println!("{} pages", doc.page_count());
+    }
+}

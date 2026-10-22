@@ -373,6 +373,109 @@ pub struct PasswordAsk {
     pub owner: bool,
 }
 
+/// Undo states. Each is the whole file, but a state that begins with the bytes of the state it
+/// grew from (as incremental saves do) keeps only what it adds after them, so a long edit session
+/// on a big document costs little memory.
+struct History {
+    states: Vec<State>,
+}
+
+enum State {
+    Full(Rc<Vec<u8>>),
+    /// The first `prefix` bytes of state `parent`, then `tail`.
+    Tail { parent: usize, prefix: usize, tail: Vec<u8> },
+}
+
+/// How many leading bytes two buffers share.
+fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    let mut k = 0;
+    // Compare in blocks first (fast), then byte by byte inside the first block that differs.
+    while k + 4096 <= n && a[k..k + 4096] == b[k..k + 4096] {
+        k += 4096;
+    }
+    while k < n && a[k] == b[k] {
+        k += 1;
+    }
+    k
+}
+
+impl History {
+    fn new(first: Rc<Vec<u8>>) -> History {
+        History { states: vec![State::Full(first)] }
+    }
+
+    fn len(&self) -> usize {
+        self.states.len()
+    }
+
+    /// The whole file for state `i`: its nearest full state, with each tail on the way applied.
+    fn bytes(&self, i: usize) -> Rc<Vec<u8>> {
+        let mut chain = Vec::new();
+        let mut k = i;
+        loop {
+            match &self.states[k] {
+                State::Full(b) => {
+                    if chain.is_empty() {
+                        return b.clone();
+                    }
+                    let mut v: Vec<u8> = b.to_vec();
+                    for (prefix, tail) in chain.into_iter().rev() {
+                        v.truncate(prefix);
+                        v.extend_from_slice(tail);
+                    }
+                    return Rc::new(v);
+                }
+                State::Tail { parent, prefix, tail } => {
+                    chain.push((*prefix, tail));
+                    k = *parent;
+                }
+            }
+        }
+    }
+
+    /// Memory the state keeps of its own.
+    fn stored(&self, i: usize) -> usize {
+        match &self.states[i] {
+            State::Full(b) => b.len(),
+            State::Tail { tail, .. } => tail.len(),
+        }
+    }
+
+    /// Add the state that follows state `parent` (whose whole file is `parent_bytes`).
+    fn push(&mut self, parent: usize, parent_bytes: &[u8], bytes: Rc<Vec<u8>>) {
+        let p = common_prefix(&bytes, parent_bytes);
+        if p > 0 && p >= parent_bytes.len() / 2 {
+            self.states.push(State::Tail { parent, prefix: p, tail: bytes[p..].to_vec() });
+        } else {
+            self.states.push(State::Full(bytes));
+        }
+    }
+
+    fn truncate(&mut self, n: usize) {
+        self.states.truncate(n);
+    }
+
+    /// Drop the oldest state; the next one takes over as a full copy.
+    fn remove_first(&mut self) {
+        if self.states.len() < 2 {
+            return;
+        }
+        let next = self.bytes(1);
+        self.states.remove(0);
+        self.states[0] = State::Full(next);
+        for s in &mut self.states[1..] {
+            if let State::Tail { parent, .. } = s {
+                *parent = parent.saturating_sub(1);
+            }
+        }
+    }
+
+    fn total(&self) -> usize {
+        (0..self.len()).map(|i| self.stored(i)).sum()
+    }
+}
+
 #[derive(Default)]
 struct PageCache {
     geom: Option<Geom>,
@@ -391,7 +494,10 @@ pub struct File {
     pub signatures: Vec<crate::sign::SigInfo>,
     /// Names its autosaved copy.
     pub uid: u64,
-    history: Vec<Vec<u8>>,
+    history: History,
+    /// The whole file of the current history state (shared with the document when it was loaded
+    /// from it).
+    current: Rc<Vec<u8>>,
     at: usize,
     saved_at: Option<usize>,
     /// Displayed size of every page, in points.
@@ -402,7 +508,7 @@ pub struct File {
 }
 
 impl File {
-    fn new(doc: Doc, bytes: Vec<u8>, path: Option<PathBuf>, password: Option<String>) -> File {
+    fn new(doc: Doc, bytes: Rc<Vec<u8>>, path: Option<PathBuf>, password: Option<String>) -> File {
         let saved = path.is_some().then_some(0);
         let mut f =
             File {
@@ -412,7 +518,9 @@ impl File {
                 security: Default::default(),
                 signatures: Vec::new(),
                 uid: u64::from_le_bytes(crate::security::random_bytes(8).try_into().unwrap_or([7; 8])),
-                history: vec![bytes], at: 0, saved_at: saved, sizes: Vec::new(), revs: Vec::new(), cache: RefCell::new(Vec::new()) };
+                history: History::new(bytes.clone()),
+                current: bytes,
+                at: 0, saved_at: saved, sizes: Vec::new(), revs: Vec::new(), cache: RefCell::new(Vec::new()) };
         f.relayout();
         f
     }
@@ -424,6 +532,15 @@ impl File {
         self.cache = RefCell::new((0..n).map(|_| PageCache::default()).collect());
     }
 
+    /// The pages were reordered, added or changed: page `j` is now the unchanged old page
+    /// `order[j]`, or `None` for one to read afresh.
+    fn remap(&mut self, order: &[Option<usize>]) {
+        let mut old = std::mem::take(self.cache.get_mut());
+        self.sizes = (0..order.len()).map(|j| self.doc.page_size(j)).collect();
+        self.revs = order.iter().map(|o| o.and_then(|i| self.revs.get(i).copied()).unwrap_or(0) + 1).collect();
+        *self.cache.get_mut() = order.iter().map(|o| o.and_then(|i| old.get_mut(i).map(std::mem::take)).unwrap_or_default()).collect();
+    }
+
     pub fn name(&self) -> String {
         self.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled.pdf".into())
     }
@@ -433,8 +550,13 @@ impl File {
     }
 
     /// The latest recorded state of the document (what autosave writes).
-    pub fn current_state(&self) -> Option<&[u8]> {
-        self.history.get(self.at).map(Vec::as_slice)
+    pub fn current_state(&self) -> Option<Rc<Vec<u8>>> {
+        Some(self.current.clone())
+    }
+
+    /// The bytes the document was opened from.
+    pub fn original(&self) -> Rc<Vec<u8>> {
+        self.history.bytes(0)
     }
 
     /// Which history state is current; changes whenever the document does.
@@ -503,6 +625,25 @@ impl File {
         self.cached(i, |c| &mut c.annots, |p| Rc::new(p.annots())).unwrap_or_default()
     }
 
+    /// A page's annotations if they have been read already (reading them loads the page).
+    pub fn annots_if_read(&self, i: usize) -> Option<Rc<Vec<Annot>>> {
+        self.cache.borrow().get(i).and_then(|c| c.annots.clone())
+    }
+
+    /// Read the annotations of up to `budget` more pages; returns how many pages are still to read.
+    /// Panels that list every page's annotations read a few per frame, so long documents stay
+    /// responsive.
+    pub fn preload_annots(&self, budget: usize) -> usize {
+        let missing: Vec<usize> = {
+            let cache = self.cache.borrow();
+            (0..cache.len()).filter(|&i| cache[i].annots.is_none()).collect()
+        };
+        for &i in missing.iter().take(budget) {
+            self.annots(i);
+        }
+        missing.len().saturating_sub(budget)
+    }
+
     pub fn glyphs(&self, i: usize) -> Rc<Vec<Glyph>> {
         self.cached(i, |c| &mut c.glyphs, |p| Rc::new(p.glyphs())).unwrap_or_default()
     }
@@ -520,7 +661,7 @@ impl File {
 
     /// A second, independent copy of the current document (for copying pages within it).
     pub fn snapshot(&self) -> Option<Doc> {
-        Doc::open(self.history[self.at].clone(), self.password.as_deref()).ok()
+        Doc::open_shared(self.current.clone(), self.password.as_deref()).ok()
     }
 }
 
@@ -537,8 +678,15 @@ pub struct PageModel {
 
 impl PageModel {
     pub fn load(f: &File, page: usize) -> Result<PageModel, String> {
-        let bytes = f.doc.save_plain()?;
-        let data = incremental::page_data(&bytes, page)?;
+        let mut bytes = f.doc.save_plain()?;
+        let data = match incremental::page_data(&bytes, page) {
+            Ok(d) => d,
+            Err(_) => {
+                // A file whose structure PDFium repaired on opening reads better rewritten.
+                bytes = f.doc.save_plain_full()?;
+                incremental::page_data(&bytes, page)?
+            }
+        };
         let parsed = content::parse(&data.content, &data.xobjects);
         let p = f.doc.page(page).ok_or("The page could not be loaded.")?;
         let kinds = p.kinds();
@@ -711,11 +859,13 @@ impl Editor {
 
     /// Open `bytes` read from `path`; asks for a password if the file needs one.
     pub fn open_bytes(&mut self, path: &Path, bytes: Vec<u8>, password: Option<String>) {
-        match Doc::open(bytes.clone(), password.as_deref()) {
+        // One buffer, shared by PDFium and the undo history.
+        let shared = Rc::new(bytes);
+        match Doc::open_shared(shared.clone(), password.as_deref()) {
             Ok(doc) => {
                 self.password = None;
-                let signatures = crate::sign::verify_all(&bytes, &doc);
-                let (doc, bytes) = settle_appearances(doc, bytes, password.as_deref());
+                let signatures = crate::sign::verify_all(&shared, &doc);
+                let (doc, bytes) = settle_appearances(doc, shared, password.as_deref());
                 let mut file = File::new(doc, bytes, Some(path.to_path_buf()), password);
                 file.signatures = signatures;
                 self.file = Some(file);
@@ -740,10 +890,22 @@ impl Editor {
             }
             Err(OpenError::Password) => {
                 let wrong = password.is_some();
+                let bytes = Rc::try_unwrap(shared).unwrap_or_else(|rc| rc.to_vec());
                 self.password = Some(PasswordAsk { path: path.to_path_buf(), bytes, text: String::new(), wrong, owner: false });
             }
             Err(OpenError::Failed(msg)) => self.error = Some(format!("Could not open {}. {msg}", path.display())),
         }
+    }
+
+    /// After repeated failures: drop anything half done (typing, dragging, selection, tools).
+    pub fn reset_after_failure(&mut self) {
+        self.clear_transient();
+        self.tool = Tool::Select;
+        self.image = None;
+        self.palette = None;
+        self.find = None;
+        self.view = View::default();
+        self.goto = Some(self.current);
     }
 
     /// The author restricted changes and the owner password has not been given.
@@ -756,7 +918,7 @@ impl Editor {
         if on && !self.editing && self.restricted() && let Some(f) = &self.file {
             // The author restricted changes: the owner password unlocks them.
             if let Some(path) = f.path.clone() {
-                self.password = Some(PasswordAsk { path, bytes: f.history[0].clone(), text: String::new(), wrong: false, owner: true });
+                self.password = Some(PasswordAsk { path, bytes: f.original().to_vec(), text: String::new(), wrong: false, owner: true });
             } else {
                 self.error = Some("The author of this document does not allow changes to it.".into());
             }
@@ -860,7 +1022,7 @@ impl Editor {
     pub fn open_untitled(&mut self, doc: Doc) {
         match doc.save() {
             Ok(bytes) => {
-                self.file = Some(File::new(doc, bytes, None, None));
+                self.file = Some(File::new(doc, Rc::new(bytes), None, None));
                 self.after_open();
             }
             Err(e) => self.error = Some(e),
@@ -877,10 +1039,11 @@ impl Editor {
     /// Open a file without showing it, for work on many files at once.
     pub fn open_headless(path: &Path) -> Result<Editor, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("{} could not be read ({e}).", path.display()))?;
-        match Doc::open(bytes.clone(), None) {
+        let shared = Rc::new(bytes);
+        match Doc::open_shared(shared.clone(), None) {
             Ok(doc) => {
                 let mut ed = Editor::default();
-                ed.file = Some(File::new(doc, bytes, Some(path.to_path_buf()), None));
+                ed.file = Some(File::new(doc, shared, Some(path.to_path_buf()), None));
                 ed.editing = true;
                 Ok(ed)
             }
@@ -894,6 +1057,8 @@ impl Editor {
         use crate::security::Security;
         let f = self.file.as_ref().ok_or("No document is open.")?;
         match &f.security {
+            // A signed document is saved as an update after its signatures, which stay valid.
+            Security::Keep if !f.signatures.is_empty() => f.doc.save_incremental(),
             Security::Keep => f.doc.save(),
             Security::Remove => f.doc.save_plain(),
             Security::Protect(p) => f.doc.save_plain().and_then(|b| crate::security::encrypt(&b, p)),
@@ -968,17 +1133,26 @@ impl Editor {
         }
         self.needs_commit = false;
         let Some(f) = &mut self.file else { return };
-        match f.doc.save() {
+        // An incremental save: the file as last loaded plus the changes, so the history keeps
+        // only the changes.
+        match f.doc.save_incremental() {
             Ok(bytes) => {
+                let bytes = Rc::new(bytes);
                 f.history.truncate(f.at + 1);
                 if f.saved_at.is_some_and(|s| s > f.at) {
                     f.saved_at = None;
                 }
-                f.history.push(bytes);
+                f.history.push(f.at, &f.current, bytes.clone());
                 f.at += 1;
-                let mut total: usize = f.history.iter().map(Vec::len).sum();
-                while total > HISTORY_BUDGET && f.history.len() > 2 {
-                    total -= f.history.remove(0).len();
+                f.current = bytes.clone();
+                // Start PDFium over from these bytes: what it reads from now on is then not written
+                // out again by the next save (an incremental save writes everything PDFium has
+                // read). The page pictures and cached page facts stay valid: the pages are the same.
+                if let Ok(doc) = Doc::open_shared(bytes, f.password.as_deref()) {
+                    f.doc = doc;
+                }
+                while f.history.total() > HISTORY_BUDGET && f.history.len() > 2 {
+                    f.history.remove_first();
                     f.at -= 1;
                     f.saved_at = f.saved_at.and_then(|s| s.checked_sub(1));
                 }
@@ -1004,7 +1178,8 @@ impl Editor {
 
     fn reload(&mut self) {
         let Some(f) = &mut self.file else { return };
-        match Doc::open(f.history[f.at].clone(), f.password.as_deref()) {
+        f.current = f.history.bytes(f.at);
+        match Doc::open_shared(f.current.clone(), f.password.as_deref()) {
             Ok(doc) => {
                 f.doc = doc;
                 f.relayout();
@@ -1057,6 +1232,32 @@ impl Editor {
         let f = self.file.as_mut()?;
         let r = op(f);
         f.relayout();
+        self.clear_transient();
+        self.epoch += 1;
+        self.needs_commit = true;
+        Some(r)
+    }
+
+    /// Like `apply_doc`, for a change that touches only `pages` and leaves every page where it is.
+    pub fn apply_doc_on<R>(&mut self, pages: &[usize], op: impl FnOnce(&File) -> R) -> Option<R> {
+        let n = self.file.as_ref()?.page_count();
+        let order = (0..n).map(|i| (!pages.contains(&i)).then_some(i)).collect();
+        self.apply_doc_mapped(order, op)
+    }
+
+    /// Like `apply_doc`, for a change after which page `j` is the unchanged old page `order[j]`
+    /// (`None` for a new or changed one). What is known about the unchanged pages is kept, so they
+    /// are not read again: each page PDFium reads is written out again by the next save, which on
+    /// a long document would make every undo state nearly the whole file.
+    pub fn apply_doc_mapped<R>(&mut self, order: Vec<Option<usize>>, op: impl FnOnce(&File) -> R) -> Option<R> {
+        self.commit_edits();
+        let f = self.file.as_mut()?;
+        let r = op(f);
+        if f.doc.page_count() == order.len() {
+            f.remap(&order);
+        } else {
+            f.relayout();
+        }
         self.clear_transient();
         self.epoch += 1;
         self.needs_commit = true;
@@ -1573,7 +1774,8 @@ impl Editor {
         let f = self.file.as_ref()?;
         let was_encrypted = f.doc.encrypted();
         let permissions = f.doc.permissions();
-        let result = f.doc.save_plain().and_then(annots::Update::load).and_then(|mut u| {
+        let update = f.doc.save_plain().and_then(annots::Update::load).or_else(|_| f.doc.save_plain_full().and_then(annots::Update::load));
+        let result = update.and_then(|mut u| {
             let r = change(&mut u)?;
             Ok((u.finish()?, r))
         });
@@ -1850,7 +2052,7 @@ impl Editor {
     pub fn rotate_pages(&mut self, turns: i32) {
         let pages = self.selected_pages();
         let n = pages.len();
-        self.apply_doc(|f| {
+        self.apply_doc_on(&pages, |f| {
             for &i in &pages {
                 f.doc.rotate_page(i, turns);
             }
@@ -1866,7 +2068,8 @@ impl Editor {
             return;
         }
         let n = pages.len();
-        self.apply_doc(|f| {
+        let order = (0..total).filter(|i| !pages.contains(i)).map(Some).collect();
+        self.apply_doc_mapped(order, |f| {
             for &i in pages.iter().rev() {
                 f.doc.delete_page(i);
             }
@@ -1881,7 +2084,9 @@ impl Editor {
     pub fn insert_blank(&mut self, after: usize) {
         let Some(f) = &self.file else { return };
         let (w, h) = f.sizes.get(after).copied().unwrap_or((595.0, 842.0));
-        self.apply_doc(|f| f.doc.insert_blank(after + 1, w, h));
+        let mut order: Vec<Option<usize>> = (0..f.page_count()).map(Some).collect();
+        order.insert((after + 1).min(order.len()), None);
+        self.apply_doc_mapped(order, |f| f.doc.insert_blank(after + 1, w, h));
         self.page_sel = vec![after + 1];
         self.goto = Some(after + 1);
     }
@@ -1940,7 +2145,17 @@ impl Editor {
             return;
         }
         let n = pages.len();
-        if self.apply_doc(|f| f.doc.move_pages(&pages, dest)) == Some(true) {
+        let total = self.file.as_ref().map_or(0, |f| f.page_count());
+        let mut order: Vec<Option<usize>> = (0..total).filter(|i| !pages.contains(i)).map(Some).collect();
+        let at = dest.min(order.len());
+        order.splice(at..at, pages.iter().map(|&p| Some(p)));
+        let moved = self.apply_doc_mapped(order, |f| f.doc.move_pages(&pages, dest));
+        if moved == Some(false)
+            && let Some(f) = &mut self.file
+        {
+            f.relayout();
+        }
+        if moved == Some(true) {
             self.page_sel = (dest..dest + n).collect();
             self.say(format!("Moved {}", plural(n, "page", "pages")));
         }
@@ -1968,7 +2183,7 @@ impl Editor {
 /// For files with /NeedAppearances: draw every annotation's appearance once (by loading each
 /// page), then clear the flag, so PDFium does not redraw them on every load and leave copies
 /// behind. Other files come back unchanged.
-fn settle_appearances(doc: Doc, bytes: Vec<u8>, password: Option<&str>) -> (Doc, Vec<u8>) {
+fn settle_appearances(doc: Doc, bytes: Rc<Vec<u8>>, password: Option<&str>) -> (Doc, Rc<Vec<u8>>) {
     if !bytes.windows(15).any(|w| w == b"NeedAppearances") || doc.encrypted() {
         return (doc, bytes);
     }
@@ -1976,7 +2191,8 @@ fn settle_appearances(doc: Doc, bytes: Vec<u8>, password: Option<&str>) -> (Doc,
         drop(doc.page(i));
     }
     let Some(fixed) = doc.save().ok().and_then(|b| incremental::clear_need_appearances(&b)) else { return (doc, bytes) };
-    match Doc::open(fixed.clone(), password) {
+    let fixed = Rc::new(fixed);
+    match Doc::open_shared(fixed.clone(), password) {
         Ok(d) => (d, fixed),
         Err(_) => (doc, bytes),
     }
@@ -2024,4 +2240,187 @@ pub fn parse_ranges(s: &str, count: usize) -> Result<Vec<Vec<usize>>, String> {
         return Err("Enter at least one page range, for example 1-3, 4-10.".into());
     }
     Ok(groups)
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn tails_share_their_base() {
+        let base = Rc::new(vec![7u8; 100_000]);
+        let mut h = History::new(base.clone());
+        let mut grown = base.to_vec();
+        grown.extend_from_slice(b"appended update");
+        h.push(0, &base, Rc::new(grown.clone()));
+        assert_eq!(h.stored(1), 15);
+        assert_eq!(*h.bytes(1), grown);
+        // A chain: the third grows from the second.
+        let mut third = grown.clone();
+        third.extend_from_slice(b" and more");
+        h.push(1, &grown, Rc::new(third.clone()));
+        assert_eq!(h.stored(2), 9);
+        assert_eq!(*h.bytes(2), third);
+        h.push(2, &third, Rc::new(vec![1, 2, 3]));
+        assert_eq!(h.stored(3), 3, "unrelated bytes are kept whole");
+        // Dropping the oldest keeps the rest whole.
+        h.remove_first();
+        assert_eq!(*h.bytes(0), grown);
+        assert_eq!(*h.bytes(1), third);
+        assert_eq!(common_prefix(b"abcdef", b"abcxyz"), 3);
+    }
+
+    /// Ten edits on the 900-page file keep the history small, and undo restores (run with
+    /// --ignored; needs pdfium.dll and target/devtools/out/big.pdf).
+    #[test]
+    #[ignore]
+    fn history_stays_small_on_a_big_document() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"));
+        pdf::init(base.join("target/debug").as_path()).unwrap();
+        let mut ed = Editor::open_headless(&base.join("target/devtools/out/big.pdf")).unwrap();
+        let size = ed.file.as_ref().unwrap().history.total();
+        for k in 0..10 {
+            ed.page_sel = vec![k];
+            ed.rotate_pages(1);
+            ed.commit();
+        }
+        let f = ed.file.as_ref().unwrap();
+        let added = f.history.total() - size;
+        println!("file {} KB, ten edits add {} KB to the history", size / 1024, added / 1024);
+        assert!(added < size, "far less than ten copies");
+        for _ in 0..10 {
+            ed.undo();
+        }
+        let f = ed.file.as_ref().unwrap();
+        assert_eq!(f.at, 0);
+        assert_eq!(f.doc.page(0).unwrap().geom().w, f.sizes[0].0);
+    }
+
+    /// Editing a signed document and saving keeps the signature valid for what was signed.
+    #[test]
+    #[ignore]
+    fn signed_documents_stay_signed() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"));
+        pdf::init(base.join("target/debug").as_path()).unwrap();
+        let dir = std::env::temp_dir().join("dockit-sign-test");
+        let signed = dir.join("signed.pdf");
+        if !signed.exists() {
+            return;
+        }
+        let mut ed = Editor::default();
+        ed.open_path(&signed);
+        assert!(ed.file.as_ref().unwrap().signatures.iter().all(|s| s.valid && s.whole));
+        ed.add_arrow(0, (20.0, 20.0), (80.0, 80.0));
+        let out = dir.join("signed-edited.pdf");
+        ed.write_to(&out).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let doc = Doc::open(bytes.clone(), None).unwrap();
+        let sigs = crate::sign::verify_all(&bytes, &doc);
+        assert!(sigs.iter().all(|s| s.valid && !s.whole), "valid for the signed version, with a change after");
+    }
+}
+
+#[cfg(test)]
+mod leak_check {
+    use super::*;
+
+    fn private_mb() -> usize {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        unsafe {
+            let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
+            c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+            K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb);
+            c.PrivateUsage / (1 << 20)
+        }
+    }
+
+    /// Memory over many edits and renders, without a window (run with --ignored --nocapture).
+    #[test]
+    #[ignore]
+    fn memory_over_edits() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"));
+        pdf::init(base.join("target/debug").as_path()).unwrap();
+        let mut ed = Editor::open_headless(&base.join("target/devtools/out/big.pdf")).unwrap();
+        println!("open: {} MB", private_mb());
+        for k in 0..90 {
+            ed.page_sel = vec![0];
+            ed.rotate_pages(1);
+            ed.commit();
+            // Draw a few pages, as the view would.
+            let f = ed.file.as_ref().unwrap();
+            for p in (k * 7 % 890)..(k * 7 % 890 + 3) {
+                let (w, h) = f.sizes[p];
+                let _ = f.doc.page(p).unwrap().render(2.4, [0, 0, (w * 2.4) as i32, (h * 2.4) as i32]);
+                let _ = f.objects(p);
+                let _ = f.annots(p);
+            }
+            if k % 30 == 29 {
+                println!("after {} edits: {} MB (history {} KB)", k + 1, private_mb(), f.history.total() / 1024);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod page_cache {
+    use super::*;
+
+    /// After page operations, what is cached for each page is what reading it afresh gives.
+    fn check_cache(f: &File) {
+        let fresh = Doc::open_shared(f.doc.save_plain_full().map(Rc::new).unwrap(), None).unwrap();
+        assert_eq!(f.page_count(), fresh.page_count());
+        for p in 0..f.page_count() {
+            assert_eq!(f.sizes[p], fresh.page_size(p), "size of page {p}");
+            if let Some(a) = f.annots_if_read(p) {
+                let b = fresh.page(p).unwrap().annots();
+                assert_eq!(a.iter().map(|x| x.subtype).collect::<Vec<_>>(), b.iter().map(|x| x.subtype).collect::<Vec<_>>(), "annotations of page {p}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn kept_through_page_operations() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"));
+        pdf::init(base.join("target/debug").as_path()).unwrap();
+        let mut ed = Editor::open_headless(&base.join("target/devtools/samples/lua.pdf")).unwrap();
+        ed.add_arrow(1, (20.0, 20.0), (80.0, 80.0));
+        ed.add_arrow(3, (20.0, 20.0), (60.0, 90.0));
+        ed.commit();
+        let f = ed.file.as_ref().unwrap();
+        while f.preload_annots(100) > 0 {}
+        ed.page_sel = vec![1];
+        ed.rotate_pages(1);
+        check_cache(ed.file.as_ref().unwrap());
+        ed.move_pages(vec![1, 3], 0);
+        check_cache(ed.file.as_ref().unwrap());
+        ed.insert_blank(0);
+        check_cache(ed.file.as_ref().unwrap());
+        ed.page_sel = vec![2];
+        ed.delete_pages();
+        check_cache(ed.file.as_ref().unwrap());
+    }
+
+    /// With every page's annotations read (as the Comments panel does), each edit on the
+    /// 900-page file adds only a little to the history (needs target/devtools/out/big.pdf).
+    #[test]
+    #[ignore]
+    fn edits_stay_small_after_reading_every_page() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"));
+        pdf::init(base.join("target/debug").as_path()).unwrap();
+        let mut ed = Editor::open_headless(&base.join("target/devtools/out/big.pdf")).unwrap();
+        let file = ed.file.as_ref().unwrap().current.len();
+        for k in 0..4 {
+            let f = ed.file.as_ref().unwrap();
+            while f.preload_annots(1000) > 0 {}
+            ed.page_sel = vec![k];
+            ed.rotate_pages(1);
+            ed.commit();
+        }
+        let f = ed.file.as_ref().unwrap();
+        let last = f.history.stored(f.history.len() - 1);
+        println!("file {} KB, last edit {} KB", file / 1024, last / 1024);
+        assert!(last < file / 10, "an edit adds far less than the file");
+    }
 }

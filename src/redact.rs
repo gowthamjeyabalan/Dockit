@@ -82,6 +82,13 @@ impl Editor {
     }
 
     /// Redaction marks on each page, as (page, rect, annotation index).
+    /// Redaction marks on the pages read so far: cheap enough for every frame (marks are made on
+    /// pages that are showing, so these are the ones that matter while marking).
+    pub fn redaction_marks_seen(&self) -> usize {
+        let Some(f) = &self.file else { return 0 };
+        (0..f.page_count()).filter_map(|p| f.annots_if_read(p)).map(|a| a.iter().filter(|a| a.subtype == pdf::ANNOT_REDACT).count()).sum()
+    }
+
     pub fn redaction_marks(&self) -> Vec<(usize, [f32; 4], usize)> {
         let Some(f) = &self.file else { return Vec::new() };
         (0..f.page_count()).flat_map(|p| f.annots(p).iter().filter(|a| a.subtype == pdf::ANNOT_REDACT).map(|a| (p, a.rect, a.index)).collect::<Vec<_>>()).collect()
