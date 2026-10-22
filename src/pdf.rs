@@ -1205,6 +1205,30 @@ impl<'d> Page<'d> {
         true
     }
 
+    /// Where the page is cut after printing (l, b, r, t).
+    pub fn set_trim_box(&self, r: [f32; 4]) {
+        unsafe { lib().FPDFPage_SetTrimBox(self.h, r[0], r[1], r[2], r[3]) };
+        self.touch();
+    }
+
+    /// How far printing runs past the trim (l, b, r, t).
+    pub fn set_bleed_box(&self, r: [f32; 4]) {
+        unsafe { lib().FPDFPage_SetBleedBox(self.h, r[0], r[1], r[2], r[3]) };
+        self.touch();
+    }
+
+    /// The trim box, if the page has one.
+    pub fn trim_box(&self) -> Option<[f32; 4]> {
+        let (mut l, mut b, mut r, mut t) = (0.0, 0.0, 0.0, 0.0);
+        (unsafe { lib().FPDFPage_GetTrimBox(self.h, &mut l, &mut b, &mut r, &mut t) } != 0).then_some([l, b, r, t])
+    }
+
+    /// An image object's size in pixels.
+    pub fn image_pixels(&self, i: usize) -> Option<(u32, u32)> {
+        let (mut w, mut h) = (0, 0);
+        (unsafe { lib().FPDFImageObj_GetImagePixelSize(self.obj(i), &mut w, &mut h) } != 0 && w > 0).then_some((w as u32, h as u32))
+    }
+
     /// The crop box (l, b, r, t), or the media box when there is none.
     pub fn crop_box(&self) -> [f32; 4] {
         let (mut l, mut b, mut r, mut t) = (0.0, 0.0, 0.0, 0.0);

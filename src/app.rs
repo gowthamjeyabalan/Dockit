@@ -112,6 +112,11 @@ pub struct App {
     attachments: Option<crate::docinfo::AttachmentsDialog>,
     batch: Option<crate::batch::BatchDialog>,
     reader: Option<crate::speech::Reader>,
+    access: Option<crate::accessibility::CheckDialog>,
+    alt: Option<crate::accessibility::AltDialog>,
+    standard: Option<crate::standards::StandardDialog>,
+    preflight: Option<crate::standards::PreflightDialog>,
+    marks: Option<crate::standards::MarksDialog>,
     autosave: crate::recovery::Autosave,
     settings_win: crate::settings::SettingsWindow,
     /// Files handed over by later launches (double-clicked in Explorer).
@@ -175,6 +180,11 @@ impl App {
             attachments: None,
             batch: None,
             reader: None,
+            access: None,
+            alt: None,
+            standard: None,
+            preflight: None,
+            marks: None,
             autosave: Default::default(),
             settings_win: Default::default(),
             incoming: broken_none.then(|| crate::instance::listen(cc.egui_ctx.clone())),
@@ -362,6 +372,11 @@ impl App {
             || self.sanitize.is_some()
             || self.attachments.is_some()
             || self.batch.is_some()
+            || self.access.is_some()
+            || self.alt.is_some()
+            || self.standard.is_some()
+            || self.preflight.is_some()
+            || self.marks.is_some()
             || self.export.is_some() || self.images.is_some() || self.ask_save.is_some() || self.combine.is_some() || self.split.is_some() || self.pad.is_some() || self.ed.password.is_some() || self.ed.error.is_some()
     }
 
@@ -655,6 +670,12 @@ impl App {
             Cmd::Attachments => self.attachments = Some(crate::docinfo::AttachmentsDialog::new()),
             Cmd::Batch => self.batch = Some(crate::batch::BatchDialog::new()),
             Cmd::DetectFields => ed.detect_fields(),
+            Cmd::AccessCheck => self.access = Some(crate::accessibility::CheckDialog::new(&self.ed)),
+            Cmd::AltText => self.alt = Some(crate::accessibility::AltDialog::new(&self.ed)),
+            Cmd::PdfA => self.standard = Some(crate::standards::StandardDialog::new(crate::standards::Standard::PdfA)),
+            Cmd::PdfX => self.standard = Some(crate::standards::StandardDialog::new(crate::standards::Standard::PdfX)),
+            Cmd::Preflight => self.preflight = Some(crate::standards::PreflightDialog::new(&self.ed)),
+            Cmd::PrintMarks => self.marks = Some(crate::standards::MarksDialog::new()),
             Cmd::Settings => self.settings_win.open = true,
             Cmd::Tool(t) => panels::choose_tool(ed, t),
         }
@@ -792,6 +813,17 @@ impl App {
                 self.item(ui, Cmd::Properties);
                 self.item(ui, Cmd::Attachments);
                 self.item(ui, Cmd::DetectFields);
+                ui.menu_button("Accessibility", |ui| {
+                    self.item(ui, Cmd::AccessCheck);
+                    self.item(ui, Cmd::AltText);
+                });
+                ui.menu_button("Standards and print", |ui| {
+                    self.item(ui, Cmd::PdfA);
+                    self.item(ui, Cmd::PdfX);
+                    ui.separator();
+                    self.item(ui, Cmd::Preflight);
+                    self.item(ui, Cmd::PrintMarks);
+                });
                 ui.separator();
                 self.item(ui, Cmd::Security);
                 self.item(ui, Cmd::Tool(Tool::Redact));
@@ -1103,6 +1135,38 @@ impl eframe::App for App {
             && !crate::batch::batch_window(&ctx, d)
         {
             self.batch = None;
+        }
+        if let Some(d) = &mut self.access {
+            let (keep, ask) = crate::accessibility::check_window(&ctx, &mut self.ed, d);
+            if !keep {
+                self.access = None;
+            }
+            match ask {
+                Some(crate::accessibility::CheckAsk::Properties) => self.properties = Some(crate::docinfo::PropertiesDialog::new(&self.ed)),
+                Some(crate::accessibility::CheckAsk::Ocr) => self.ocr = Some(crate::ocr::OcrDialog::new()),
+                Some(crate::accessibility::CheckAsk::AltText) => self.alt = Some(crate::accessibility::AltDialog::new(&self.ed)),
+                None => {}
+            }
+        }
+        if let Some(d) = &mut self.alt
+            && !crate::accessibility::alt_window(&ctx, &mut self.ed, d)
+        {
+            self.alt = None;
+        }
+        if let Some(d) = &mut self.standard
+            && !crate::standards::standard_window(&ctx, &mut self.ed, d)
+        {
+            self.standard = None;
+        }
+        if let Some(d) = &mut self.preflight
+            && !crate::standards::preflight_window(&ctx, &mut self.ed, d)
+        {
+            self.preflight = None;
+        }
+        if let Some(d) = &mut self.marks
+            && !crate::standards::marks_window(&ctx, &mut self.ed, d)
+        {
+            self.marks = None;
         }
         if let Some(r) = &mut self.reader
             && !crate::speech::reader_bar(&ctx, &mut self.ed, r)

@@ -625,6 +625,9 @@ pub enum Edit {
     Inline(Vec<u8>),
     /// Move this object to the start of the content, behind everything else.
     ToStart,
+    /// Wrap the object's drawing operators in these (marked-content tags such as
+    /// "/P <</MCID 0>> BDC" and "EMC"), leaving the operators themselves as they are.
+    Mark(String, String),
 }
 
 pub fn num(v: f64) -> String {
@@ -801,6 +804,13 @@ pub fn edit(src: &[u8], parsed: &Parsed, starts: &[Option<M>], edits: &[(usize, 
         let lines = list.iter().find_map(|e| if let Edit::Lines(l) = e { Some(l.clone()) } else { None });
         let inline = list.iter().find_map(|e| if let Edit::Inline(b) = e { Some(b.clone()) } else { None });
         let to_start = list.iter().any(|e| matches!(e, Edit::ToStart));
+        if let Some((open, close)) = list.iter().find_map(|e| if let Edit::Mark(a, b) = e { Some((a.clone(), b.clone())) } else { None }) {
+            push(&mut before, o.first, &open);
+            after.entry(o.last).or_default().push_str(&format!("\n{close}"));
+            if list.len() == 1 {
+                continue;
+            }
+        }
 
         if let Some(bytes) = inline {
             replace_raw.insert(o.first, bytes);

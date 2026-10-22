@@ -2,6 +2,7 @@
 //! fill in forms and sign. PDFium (Chrome's PDF engine) reads, draws and writes the files.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod accessibility;
 mod annots;
 mod app;
 mod batch;
@@ -32,6 +33,7 @@ mod security;
 mod settings;
 mod sign;
 mod speech;
+mod standards;
 mod theme;
 
 /// Every tool, in the order the Tools panel lists them (used for keyboard shortcuts).

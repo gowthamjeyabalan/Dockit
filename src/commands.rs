@@ -102,6 +102,12 @@ pub enum Cmd {
     Attachments,
     Batch,
     DetectFields,
+    AccessCheck,
+    AltText,
+    PdfA,
+    PdfX,
+    Preflight,
+    PrintMarks,
     // Settings
     Settings,
     Tool(Tool),
@@ -164,6 +170,12 @@ impl Cmd {
             Cmd::Attachments => "Attached files…".into(),
             Cmd::Batch => "Batch process…".into(),
             Cmd::DetectFields => "Find form fields".into(),
+            Cmd::AccessCheck => "Accessibility check…".into(),
+            Cmd::AltText => "Describe figures…".into(),
+            Cmd::PdfA => "Save as PDF/A…".into(),
+            Cmd::PdfX => "Save as PDF/X-4…".into(),
+            Cmd::Preflight => "Print production check…".into(),
+            Cmd::PrintMarks => "Printer's marks…".into(),
             Cmd::Settings => "Settings".into(),
             Cmd::Tool(t) => format!("{} tool", t.name()),
         }
@@ -194,6 +206,12 @@ impl Cmd {
             Cmd::Attachments => "embedded files attach",
             Cmd::Batch => "many files folder automate action",
             Cmd::DetectFields => "detect automatic form fields fillable",
+            Cmd::AccessCheck => "accessibility screen reader tags pdf/ua",
+            Cmd::AltText => "alternate text alt images figures accessibility",
+            Cmd::PdfA => "archive pdfa standard",
+            Cmd::PdfX => "print press pdfx standard cmyk",
+            Cmd::Preflight => "preflight print press inks separations coverage resolution",
+            Cmd::PrintMarks => "crop marks bleed registration trim",
             Cmd::Crop => "trim margins paper size",
             Cmd::Stamp => "bates header footer watermark numbers",
             Cmd::Layout(_) | Cmd::CoverPage => "view layout pages spread book",
@@ -233,6 +251,7 @@ impl Cmd {
                 | Cmd::FindRedact
                 | Cmd::Sanitize
                 | Cmd::DetectFields
+                | Cmd::PrintMarks
                 | Cmd::Tool(_)
         )
     }
@@ -288,6 +307,12 @@ pub fn sections() -> Vec<(&'static str, Vec<Cmd>)> {
                 Cmd::Properties,
                 Cmd::Attachments,
                 Cmd::DetectFields,
+                Cmd::AccessCheck,
+                Cmd::AltText,
+                Cmd::PdfA,
+                Cmd::PdfX,
+                Cmd::Preflight,
+                Cmd::PrintMarks,
                 Cmd::Security,
                 Cmd::FindRedact,
                 Cmd::Sanitize,
